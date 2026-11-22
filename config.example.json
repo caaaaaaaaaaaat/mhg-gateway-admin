@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Default config for running the console directly on a Linux server
+# (systemd / manual), NOT inside a container. `docker-compose.yml` uses
+# config/docker.json instead.
+#
+# Every field can be overridden by an MHGA_* environment variable; the README
+# lists them. Relative paths resolve against THIS FILE's directory.
+
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8720,
+    "publicUrl": "",
+    "trustProxy": false
+  },
+  "auth": {
+    "cookieName": "mhg_admin_session",
+    "sessionTtlHours": 12,
+    "sessionMaxDays": 30,
+    "passwordMinLength": 10,
+    "maxFailedLogins": 8,
+    "lockoutMinutes": 15,
+    "secretFile": "data/session-secret",
+    "secureCookies": "auto"
+  },
+  "storage": {
+    "driver": "sqlite",
+    "sqlite": {
+      "path": "data/mhg-gateway-admin.db"
+    },
+    "mysql": {
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "mhg",
+      "password": "",
+      "database": "mhg_gateway_admin",
+      "connectionLimit": 10,
+      "ssl": false,
+      "tablePrefix": ""
+    }
+  },
+  "gateways": {
+    "binaryPath": "",
+    "binSearchPaths": ["bin", "/usr/local/bin", "/usr/bin"],
+    "citraPortRange": [25000, 25999],
+    "roomPortRange": [24000, 24999],
+    "runtimeDir": "data/rooms",
+    "extraArgs": [],
+    "sampleIntervalMs": 2000,
+    "logRetentionDays": 7
+  },
+  "logging": {
+    "level": "info",
+    "file": ""
+  }
+}

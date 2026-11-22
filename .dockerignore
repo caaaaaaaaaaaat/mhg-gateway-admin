@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Build context exclusions.
+
+node_modules/
+data/
+mysql-data/
+.git/
+.gitignore
+*.log
+.test-*.log
+.test-*.json
+debug-*.mjs
+.deb*
+docs/
+deploy/
+test/
+bin/
+config.local.json
+config.example.json
+docker-compose.yml
+README.md
+LICENSE
+.dockerignore

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Line endings matter here: the shell scripts run inside a Linux container, and a
+# CRLF shebang line produces "env: sh\r: No such file or directory" at runtime.
+# Normalise everything to LF and let Windows checkouts convert only what is
+# genuinely platform-local.
+* text=auto eol=lf
+
+# Scripts and build inputs must stay LF on every platform.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.js        text eol=lf
+*.mjs       text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.md        text eol=lf
+.gitignore  text eol=lf
+.dockerignore text eol=lf
+*.service   text eol=lf
+
+# Binary artifacts are never converted.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.gz    binary
+*.zip   binary
+*.db    binary

@@ -1,0 +1,49 @@
+{
+  "_comment": "Container default config. SQLite on the /data volume, console on 8720. Override any field with MHGA_* environment variables (see README).",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8720,
+    "publicUrl": "",
+    "trustProxy": false
+  },
+  "auth": {
+    "cookieName": "mhg_admin_session",
+    "sessionTtlHours": 12,
+    "sessionMaxDays": 30,
+    "passwordMinLength": 10,
+    "maxFailedLogins": 8,
+    "lockoutMinutes": 15,
+    "secretFile": "/data/session-secret",
+    "secureCookies": "auto"
+  },
+  "storage": {
+    "driver": "sqlite",
+    "sqlite": {
+      "path": "/data/mhg-gateway-admin.db"
+    },
+    "mysql": {
+      "host": "mysql",
+      "port": 3306,
+      "user": "mhg",
+      "password": "",
+      "database": "mhg_gateway_admin",
+      "connectionLimit": 10,
+      "ssl": false,
+      "tablePrefix": ""
+    }
+  },
+  "gateways": {
+    "binaryPath": "",
+    "binSearchPaths": ["/app/bin", "/usr/local/bin", "/usr/bin"],
+    "citraPortRange": [25000, 25999],
+    "roomPortRange": [24000, 24999],
+    "runtimeDir": "/data/rooms",
+    "extraArgs": [],
+    "sampleIntervalMs": 2000,
+    "logRetentionDays": 7
+  },
+  "logging": {
+    "level": "info",
+    "file": ""
+  }
+}

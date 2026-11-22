@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Docker Compose for mhg-gateway-admin.
+#
+#   docker compose up -d --build
+#   open http://<server>:8720/     (first load asks you to create the admin account)
+#
+# What is configured where:
+#   * The console's own port, datasource and gateway paths: `environment` below,
+#     or config/docker.json baked into the image.
+#   * Gateway UDP ports: the gateway children bind these INSIDE the container, so
+#     they must be published to be reachable by players. The default pools are
+#     25000-25999 (Citra side) and 24000-24999 (room side). Publishing 1000 ports
+#     each is wasteful, so this file publishes a small window; widen it to match
+#     your actual room count, and keep it in sync with citraPortRange/roomPortRange.
+#
+# Note on UDP and Docker: each gateway room listens on its own UDP port. Docker's
+# userland proxy handles many short UDP ranges fine, but for tens of rooms make
+# sure the kernel's conntrack table is large enough (net.netfilter.nf_conntrack_max).
+
+services:
+  mhg-gateway-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mhg-gateway-admin:latest
+    container_name: mhg-gateway-admin
+    restart: unless-stopped
+    # tini is PID 1; the console drops to the `node` user in the entrypoint.
+    init: false
+    environment:
+      MHGA_HOST: "0.0.0.0"
+      MHGA_PORT: "8720"
+      MHGA_DB_DRIVER: "sqlite"
+      MHGA_SQLITE_PATH: "/data/mhg-gateway-admin.db"
+      MHGA_RUNTIME_DIR: "/data/rooms"
+      MHGA_LOG_LEVEL: "info"
+      # Set this when the console is served behind a reverse proxy over HTTPS, so
+      # the session cookie is marked Secure (see README "反向代理").
+      # MHGA_PUBLIC_URL: "https://gw.example.com"
+      # MHGA_TRUST_PROXY: "1"
+    ports:
+      - "8720:8720"
+      # Citra-side gateway ports (players connect here). Widen as needed.
+      - "25000-25009:25000-25009/udp"
+      # Room-side ports the gateway declares to the room server.
+      - "24000-24009:24000-24009/udp"
+    volumes:
+      # The database, session secret and per-room logs all live here. This is the
+      # only state the container keeps; everything else is replaceable.
+      - ./data:/data
+      # Optional: mount a statically linked citra-gateway binary here. Without it
+      # the console runs fine, but Start reports "找不到 citra-gateway".
+      # - ./bin:/app/bin:ro
+      # Optional: use your own config instead of the image's config/docker.json.
+      # - ./config.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8720/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Optional MySQL datasource. Enable with:
+  #   docker compose --profile mysql up -d --build
+  # and set MHGA_DB_DRIVER=mysql plus the MHGA_MYSQL_* variables on the console.
+  # The console's default MySQL host in config/docker.json is already `mysql`, so
+  # once the driver is switched the two services find each other by name.
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.4
+    container_name: mhg-gateway-admin-mysql
+    restart: unless-stopped
+    profiles: ["mysql"]
+    environment:
+      MYSQL_DATABASE: "mhg_gateway_admin"
+      MYSQL_USER: "mhg"
+      MYSQL_PASSWORD: "change-this-password"
+      MYSQL_ROOT_PASSWORD: "change-this-root-password"
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-pchange-this-root-password"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # Not published by default: only the console needs it.
+    # ports:
+    #   - "3306:3306"
