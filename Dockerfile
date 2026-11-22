@@ -61,7 +61,7 @@ ENV NODE_ENV=production \
 # fixing the data-volume ownership; it is present in bookworm-slim but installing
 # it explicitly keeps the entrypoint's dependency honest rather than incidental.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini ca-certificates util-linux \
+    && apt-get install -y --no-install-recommends tini ca-certificates util-linux libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -74,8 +74,13 @@ COPY public ./public
 COPY config/docker.json ./config.json
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
-    && mkdir -p /data/rooms /app/bin \
+# The Linux gateway ships inside the image so a mapping can be started without the
+# operator mounting anything. It is a stripped dynamic build: libzstd1 is the only
+# library it needs beyond the base image (libstdc++/libc come from bookworm-slim).
+COPY bin/citra-gateway /app/bin/citra-gateway
+
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /app/bin/citra-gateway \
+    && mkdir -p /data/rooms \
     && chown -R node:node /data /app
 
 # The container runs as the unprivileged `node` user. Gateway children inherit it,

@@ -14,7 +14,11 @@ debug-*.mjs
 docs/
 deploy/
 test/
-bin/
+# Only the Linux gateway goes into the image lay-down; the Windows .exe would be dead
+# weight in a Linux container.
+bin/*
+!bin/citra-gateway
+docs/
 config.local.json
 config.example.json
 docker-compose.yml

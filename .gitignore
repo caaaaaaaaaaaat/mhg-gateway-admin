@@ -38,7 +38,11 @@ Thumbs.db
 *.tar.gz
 mhg-gateway-admin-*.tar
 
-# Local gateway binaries. README tells the operator to drop a citra-gateway
-# build into bin/; a 23 MB executable must never enter the source history.
+# Gateway binaries. The Linux build is tracked because the image COPYs it into
+# /app/bin; it is small (1.2 MB, stripped) and has to travel with the source or a
+# cloned tree cannot build a working image.
 /bin/*
 !/bin/.gitkeep
+!/bin/citra-gateway
+# The Windows build stays out of history: 23 MB, and it is produced locally.
+/bin/citra-gateway.exe
