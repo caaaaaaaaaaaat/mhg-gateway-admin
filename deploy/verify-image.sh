@@ -248,6 +248,19 @@ D exec "$NAME" node --check /app/public/app.js >/dev/null 2>&1 \
 D exec "$NAME" sh -c 'grep -q "getElementById(.app.)" /app/public/app.js' >/dev/null 2>&1 \
     && ck 1 "镜像内 app.js 挂载点与页面一致" || ck 0 "镜像内 app.js 挂载点与页面一致"
 
+say "关于信息"
+# /api/about is public, so this needs no cookie: the About card must work for someone
+# who has not signed in, and the image must carry the same identity as the source.
+ABOUT="$(curl -s "$BASE/api/about")"
+printf '%s' "$ABOUT" | grep -q '"author":"小忆"' \
+    && ck 1 "关于接口返回作者" || note "关于响应: $(printf '%s' "$ABOUT" | head -c 200)"
+printf '%s' "$ABOUT" | grep -q '"repo":"https://github.com/caaaaaaaaaaaat/mhg-gateway-admin"' \
+    && ck 1 "关于接口返回仓库地址" || ck 0 "关于接口返回仓库地址"
+printf '%s' "$ABOUT" | grep -q '"version":"[0-9]' \
+    && ck 1 "关于接口返回版本" || ck 0 "关于接口返回版本"
+D exec "$NAME" sh -c 'grep -q "开源仓库" /app/public/app.js' >/dev/null 2>&1 \
+    && ck 1 "镜像内设置页含关于卡片" || ck 0 "镜像内设置页含关于卡片"
+
 say "数据源"
 D exec "$NAME" node -e "import('mysql2/promise').then(m=>process.exit(typeof m.createPool==='function'?0:1)).catch(()=>process.exit(1))" \
     >/dev/null 2>&1 && ck 1 "镜像内 mysql2 可加载（可切 MySQL）" || ck 0 "镜像内 mysql2 可加载"
