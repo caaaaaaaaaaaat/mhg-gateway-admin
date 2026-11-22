@@ -25,11 +25,15 @@ COPY package.json package-lock.json* ./
 # mysql2 is an optionalDependency: a full install gets it (so the same image can
 # talk to MySQL by changing config), while `--omit=dev` keeps the tree minimal.
 # `npm ci` is used when a lockfile exists, otherwise `npm install`.
+# The trailing mkdir matters: this project has no required dependencies, so a
+# tree with only optional ones could otherwise leave node_modules absent and make
+# the later `COPY --from=deps` fail.
 RUN if [ -f package-lock.json ]; then \
         npm ci --omit=dev --no-audit --no-fund; \
     else \
         npm install --omit=dev --no-audit --no-fund; \
     fi \
+    && mkdir -p node_modules \
     && npm cache clean --force \
     && rm -rf /root/.npm
 
@@ -53,8 +57,11 @@ ENV NODE_ENV=production \
 
 # tini reaps zombies: the console spawns gateway children, and a PID-1 node
 # process does not reap orphans, which would slowly accumulate defunct entries.
+# util-linux provides setpriv, which the entrypoint uses to drop root after
+# fixing the data-volume ownership; it is present in bookworm-slim but installing
+# it explicitly keeps the entrypoint's dependency honest rather than incidental.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini ca-certificates \
+    && apt-get install -y --no-install-recommends tini ca-certificates util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

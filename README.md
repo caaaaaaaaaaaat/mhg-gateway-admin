@@ -6,10 +6,27 @@
 
 > 房间的**协议翻译**由 [citra-gateway](../crossplay/citra-gateway/README.md) 完成。本项目只负责进程生命周期、配置存放和网页管理，不修改也不重写协议层。
 
+## 验证到哪一步了
+
+诚实说明交付状态，避免把「自动测试通过」当成「你可以直接无视地部署」：
+
+| 项目 | 状态 |
+|---|---|
+| 单元测试（配置/密码/令牌/数据源契约） | ✅ 65 项，64 通过，1 跳过（MySQL 需真实库），0 失败 |
+| HTTP API 与进程监管测试 | ✅ 含真实子进程启停、崩溃重启、熔断、日志轮转 |
+| 端到端故事测试（首次使用/批量启停/只读/重启持久化） | ✅ 5 个故事全通过 |
+| 真实进程 + 真实 HTTP 验证（`deploy/verify.js`） | ✅ 35/35 |
+| 容器输入静态与启动验证（`deploy/verify-container.js`） | ✅ 47/47 |
+| **实际 `docker build` 出镜像** | ❌ **未执行**——开发机没有 Docker 守护进程 |
+| 真实网关二进制联机 | ❌ 未执行——上游网关是 Windows 构建；Linux 容器需自备 Linux 版 |
+
+**镜像本身没有被构建过。** Dockerfile 与 compose 是按「应该正确」写的，并用 47 项检查排除了会导致构建失败或容器起不来的问题（COPY 源、`.dockerignore` 冲突、CRLF、entrypoint 降权、健康检查、容器配置可用性），但第一次真正 `docker build` 仍然可能暴露环境性差异。请在自己机器上先跑一次 `./deploy/build-image.sh`（它自带冒烟测试）。
+
 ---
 
 ## 目录
 
+- [验证到哪一步了](#验证到哪一步了)
 - [它解决什么问题](#它解决什么问题)
 - [快速开始](#快速开始)
   - [方式一：直接用 Node 运行](#方式一直接用-node-运行)
@@ -84,7 +101,20 @@ node src/index.js
 
 ### 方式二：Docker
 
-镜像里已经配置好 **SQLite 存容器内 `/data`**，只需挂一个卷：
+镜像里已经配置好 **SQLite 存容器内 `/data`**，只需挂一个卷。
+
+**推荐用脚本构建**：它会先跑容器输入静态检查，构建完再自动起一个容器做冒烟测试（健康检查、首次打开显示需要初始化、数据卷生成数据库与会话密钥、非 root 运行）：
+
+```bash
+# Linux / macOS
+chmod +x deploy/build-image.sh
+./deploy/build-image.sh
+
+# Windows（Docker Desktop）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\build-image.ps1
+```
+
+脚本通过后会打印可直接粘贴的运行命令。也可以手动构建：
 
 ```bash
 docker build -t mhg-gateway-admin .
@@ -97,12 +127,18 @@ docker run -d \
   -p 25000-25009:25000-25009/udp \
   -p 24000-24009:24000-24009/udp \
   -v mhg-admin-data:/data \
-  # 可选：把 citra-gateway 免安装版二进制挂进来
+  # 可选：把 citra-gateway 二进制挂进来
   # -v /path/to/citra-gateway:/app/bin/citra-gateway:ro \
   mhg-gateway-admin
 ```
 
 `/data` 里保存数据库、会话密钥和每房日志。**不挂卷 = 容器一删数据就没了。**
+
+想在不构建镜像的前提下先验证容器相关输入（COPY 路径、`.dockerignore`、CRLF、entrypoint、健康检查、容器配置能否启动）：
+
+```bash
+node deploy/verify-container.js
+```
 
 ### 方式三：Docker Compose（含可选 MySQL）
 
@@ -609,11 +645,22 @@ docker run --rm -v mhg-admin-data:/data -v "$PWD":/backup alpine \
 ## 开发与测试
 
 ```bash
-npm test            # 全量：配置 / 安全原语 / 数据源契约 / API / 进程监管 / 端到端故事
-npm run test:unit   # 只跑单元
-npm run test:api    # 只跑 HTTP 与进程
-npm run check       # 语法检查
+npm test                    # 全量：配置 / 安全原语 / 数据源契约 / API / 进程监管 / 端到端故事
+npm run test:unit           # 只跑单元
+npm run test:api            # 只跑 HTTP 与进程
+npm run check               # 语法检查
+
+node deploy/verify.js           # 真实进程 + 真实 HTTP 端到端验证（35 项）
+node deploy/verify-container.js # 容器输入验证，不需要 Docker（47 项）
 ```
+
+三个验证脚本的分工：
+
+| 脚本 | 是否起真实进程 | 是否需要 Docker | 验证什么 |
+|---|---|---|---|
+| `npm test` | 进程内 + 真实子进程（stub 网关） | 否 | 业务逻辑与 HTTP 契约 |
+| `deploy/verify.js` | 是（独立 `node src/index.js` 进程） | 否 | 像用户一样操作一遍，含重启持久化 |
+| `deploy/verify-container.js` | 是（用容器环境变量启动） | 否 | 镜像里会用到的一切，除 `docker build` 本身 |
 
 测试覆盖（全部使用真实代码路径，只有网关二进被替换成一个 Node 小脚本）：
 
@@ -623,6 +670,12 @@ npm run check       # 语法检查
 - **API**：初始化、登录/锁定、CSRF、登出、服务器与房间 CRUD、端口池分配与冲突、运行中改配置的拒绝、批量操作逐房结果、只读角色全路径拒绝、账户与拥有者保护、改密码吊销会话、请求体限制、静态资源与安全头、路径穿越、405/404 语义、密码不回显
 - **supervisor**：参数拼装、端口分配、二进制查找、缺少程序时的拒绝、启动/停止真实进程、崩溃重启与退避、**崩溃熔断**、日志读取与轮转、日志保留、重启后不静默重启遗留房间、停用会取消待执行的重启
 - **端到端故事**：首次使用全流程、真实进程批量启停、只读审计、**重启后数据仍在**、前端与后端接口一致性
+- **容器输入**：每个 COPY 源存在且未被 `.dockerignore` 排除、entrypoint 为 LF 且所用命令由镜像提供、健康检查 JS 可解析、容器配置能真正启动并写出数据库
+
+本轮开发中修掉的两个真实缺陷（都已加测试，避免回归）：
+
+1. **崩溃熔断永远不会触发**：重启计数挂在每次尝试新建的进程条目上，重启一次计数就清零，于是一个配置错误、启动即退出的房间会无限重启。计数器改为按房间保存在 supervisor 上。
+2. **停止房间不会取消待执行的重启**：退避期间的定时器在进程条目里，而条目在退出时已被删除，`stopRoom` 找不到它；操作员点了停止，房间仍会自己回来。定时器改为按房间单独存放。
 
 `node:sqlite` 在 Node 22 上会打印一次 `ExperimentalWarning`，这不是错误。
 
@@ -650,9 +703,13 @@ mhg-gateway-admin/
 │   │   └── factory.js        工厂
 │   └── routes/api.js         全部 API 路由
 ├── public/                   前端（原生 JS/CSS，无构建步骤）
-├── test/                     测试
-├── config/                   Docker 用配置
-├── deploy/                   systemd 单元
+├── test/                     自动化测试
+├── config/                   容器用配置
+├── deploy/
+│   ├── mhg-gateway-admin.service   systemd 单元
+│   ├── build-image.sh / .ps1       构建镜像 + 冒烟测试
+│   ├── verify.js                   真实进程端到端验证
+│   └── verify-container.js         容器输入验证（无需 Docker）
 ├── Dockerfile
 ├── docker-compose.yml
 └── config.example.json
