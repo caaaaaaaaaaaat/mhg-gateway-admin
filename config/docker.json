@@ -35,8 +35,7 @@
   "gateways": {
     "binaryPath": "",
     "binSearchPaths": ["/app/bin", "/usr/local/bin", "/usr/bin"],
-    "citraPortRange": [25000, 25999],
-    "roomPortRange": [24000, 24999],
+    "localPortRange": [25000, 25999],
     "runtimeDir": "/data/rooms",
     "extraArgs": [],
     "sampleIntervalMs": 2000,
