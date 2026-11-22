@@ -38,11 +38,10 @@ Thumbs.db
 *.tar.gz
 mhg-gateway-admin-*.tar
 
-# Gateway binaries. The Linux build is tracked because the image COPYs it into
-# /app/bin; it is small (1.2 MB, stripped) and has to travel with the source or a
-# cloned tree cannot build a working image.
+# Gateway binaries. Both platforms ship with the repository so a clone is runnable
+# without a toolchain: the Linux build is what the image COPYs into /app/bin, and the
+# Windows build is what a Windows checkout needs. Keep them out of any other rule here.
 /bin/*
 !/bin/.gitkeep
 !/bin/citra-gateway
-# The Windows build stays out of history: 23 MB, and it is produced locally.
-/bin/citra-gateway.exe
+!/bin/citra-gateway.exe

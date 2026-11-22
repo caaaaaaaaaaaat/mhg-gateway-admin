@@ -28,3 +28,10 @@ Dockerfile  text eol=lf
 *.gz    binary
 *.zip   binary
 *.db    binary
+# The gateway binaries ship with the repository so a fresh clone can start a mapping
+# without a compiler. Declaring them binary is what keeps git from touching the bytes:
+# a single CRLF substitution bricks an ELF or a PE, and the failure mode is a runtime
+# "cannot execute binary file" with nothing in git to show why.
+bin/citra-gateway     binary
+bin/citra-gateway.exe binary
+*.exe                 binary
