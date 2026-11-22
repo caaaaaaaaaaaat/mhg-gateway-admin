@@ -65,7 +65,10 @@ export const SESSIONS_TABLE = 'sessions';
  *   target_port    integer 1..65535 -- the upstream server's OWN port
  *   password       text upstream room password ('' means no password)
  *   listen_address text local bind address for the gateway
- *   capacity       integer known member slots (0 = unknown)
+ *   capacity       integer DEPRECATED, always 0. The room server reports its own
+ *                  member_slots after the gateway joins, so there is nothing for an
+ *                  operator to configure. The column is kept so an existing database
+ *                  still opens; the console neither writes nor displays it.
  *   profile        text 'default' | 'dual-host' | 'legacy'
  *   desired_state  text 'running' | 'stopped'
  *   state          text 'stopped' | 'starting' | 'running' | 'stopping' | 'failed'

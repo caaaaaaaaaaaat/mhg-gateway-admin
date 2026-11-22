@@ -214,6 +214,11 @@ if (mode === '--stub-exit') {
     process.stderr.write('stub exiting\\n');
     process.exit(3);
 }
+if (mode === '--stub-status') {
+    // Mimic the real per-second status line, which is what carries the capacity the
+    // room reported (slots) and the current occupancy (members).
+    process.stdout.write('t=1s clients=0 accepted=0 joined=0 slots=4 members=2 frames_in=0 forwarded=0 rejected=0\\n');
+}
 const keep = setInterval(() => {}, 1000);
 process.on('SIGTERM', () => { clearInterval(keep); process.exit(0); });
 `;

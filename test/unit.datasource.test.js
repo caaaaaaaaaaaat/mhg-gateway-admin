@@ -136,7 +136,9 @@ async function runContract(ds, { label }) {
         assert.equal(mapping.target_host, 'www.example.com', `${label}: target host round-trips`);
         assert.equal(Number(mapping.target_port), 9901, `${label}: target port round-trips`);
         assert.equal(mapping.password, 'pw');
-        assert.equal(Number(mapping.capacity), 4, `${label}: default capacity`);
+        // capacity is deprecated: the room reports its own member_slots, so the column
+        // exists only so an older database still opens.
+        assert.equal(Number(mapping.capacity), 0, `${label}: capacity is not configured`);
         assert.equal(mapping.state, 'stopped');
         assert.equal(mapping.desired_state, 'stopped');
         assert.equal(mapping.pid, null);

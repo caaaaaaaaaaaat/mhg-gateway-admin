@@ -72,7 +72,11 @@ export function buildGatewayArgs(mapping, { profile = mapping.profile ?? 'defaul
         '--listen-port', String(mapping.localPort ?? mapping.local_port),
         '--room', mapping.targetHost ?? mapping.target_host,
         '--room-port', String(mapping.targetPort ?? mapping.target_port),
-        '--room-capacity', String(mapping.capacity ?? 4),
+        // The capacity is deliberately NOT passed. An operator cannot know the room
+        // server's member_slots, and guessing it either rejects players early or lets
+        // the room overfill. Left unset (the gateway's default 0 = unknown), the
+        // gateway learns the real number from the room's own RoomInformation once it
+        // has joined, and keeps enforcing the room-full answer locally.
         // Room password is enforced locally and forwarded to the room.
         '--password', mapping.password ?? '',
     ];
@@ -176,6 +180,14 @@ export class GatewaySupervisor extends EventEmitter {
          * @type {Map<number, number[]>}
          */
         this.crashTimes = new Map();
+        /**
+         * Room numbers reported by the gateway's own status line, keyed by id:
+         * `{ slots, members, at }`. Not persisted: they describe a live connection.
+         * @type {Map<number, {slots: number, members: number, at: number}>}
+         */
+        this.liveStats = new Map();
+        /** Carry-over for status lines split across stdout chunks. @type {Map<number, string>} */
+        this.statusBuffers = new Map();
         this.timer = null;
         this.binary = null;
         this.binaryError = '';
@@ -188,6 +200,42 @@ export class GatewaySupervisor extends EventEmitter {
 
     logPathFor(mappingId) {
         return join(this.runtimeDir, `mapping-${mappingId}.log`);
+    }
+
+    /**
+     * Read the gateway's per-second status line and keep the last observed room
+     * numbers.
+     *
+     * The gateway prints `t=Ns clients=.. accepted=.. joined=.. slots=N members=M ...`
+     * where `slots` is the capacity the ROOM reported (0 = not known yet) and
+     * `members` is how many people the room currently lists. Chunks arrive split at
+     * arbitrary byte boundaries, so only complete lines are parsed and the tail of a
+     * partial line is carried over.
+     */
+    #scanStatusLine(mappingId, chunk) {
+        const previous = this.statusBuffers.get(mappingId) ?? '';
+        const text = previous + String(chunk);
+        const lines = text.split('\n');
+        // The last element is either '' (chunk ended on a newline) or a partial line.
+        this.statusBuffers.set(mappingId, lines.pop() ?? '');
+        // Bound the carry-over so a binary that never emits a newline cannot grow it.
+        const pending = this.statusBuffers.get(mappingId);
+        if (pending.length > 4096) this.statusBuffers.set(mappingId, '');
+        for (const line of lines) {
+            const match = /(?:^|\s)slots=(\d+)\s+members=(\d+)/.exec(line);
+            if (!match) continue;
+            const slots = Number(match[1]);
+            const members = Number(match[2]);
+            this.liveStats.set(mappingId, { slots, members, at: Date.now() });
+        }
+    }
+
+    /**
+     * Last room numbers reported by a running mapping, or null.
+     * `slots` is 0 until the gateway has joined and the room has answered.
+     */
+    statsOf(mappingId) {
+        return this.liveStats.get(mappingId) ?? null;
     }
 
     /** Locate the gateway binary once and remember why it was not found. */
@@ -374,7 +422,14 @@ export class GatewaySupervisor extends EventEmitter {
         const printable = args.map((value) => (value === mapping.password && value ? '***' : value));
         stream.write(`# ${new Date().toISOString()} start ${binary} ${printable.join(' ')}\n`);
 
-        proc.stdout?.on('data', (chunk) => stream.write(chunk));
+        proc.stdout?.on('data', (chunk) => {
+            stream.write(chunk);
+            // The gateway prints one status line per second that includes the room
+            // capacity it learned and the current member count. Reading it here is
+            // how the console shows the real numbers without asking an operator for
+            // them, and without a second channel.
+            this.#scanStatusLine(mappingId, chunk);
+        });
         proc.stderr?.on('data', (chunk) => stream.write(chunk));
 
         // The spawn handler and the started-state write must both finish before
@@ -407,6 +462,8 @@ export class GatewaySupervisor extends EventEmitter {
 
         proc.on('error', async (error) => {
             this.procs.delete(mappingId);
+            // The room numbers described a connection that never happened.
+            this.liveStats.delete(mappingId);
             stream.write(`# spawn error: ${error.message}\n`);
             await this.ds.updateMapping(mappingId, {
                 state: MAPPING_STATE.failed,
@@ -463,6 +520,10 @@ export class GatewaySupervisor extends EventEmitter {
 
     async #onExit(mappingId, entry, code, signal) {
         this.procs.delete(mappingId);
+        // The connection is gone, so the capacity/member numbers it reported are too.
+        // Leaving them would show a stale "3 / 4" on a mapping that is not running.
+        this.liveStats.delete(mappingId);
+        this.statusBuffers.delete(mappingId);
         try {
             entry.stream.end();
         } catch { /* stream already closed */ }

@@ -34,6 +34,10 @@ function parseExtraArgs(value) {
 /** Turn a stored mapping row into the JSON the browser consumes. */
 export function mappingView(mapping, { supervisor = null } = {}) {
     const pid = supervisor ? supervisor.pidOf(mapping.id) : null;
+    // The room's own numbers, as reported by the gateway's status line. `slots` is 0
+    // until the gateway has joined and the room has answered; the UI says so rather
+    // than inventing a capacity the operator never set.
+    const stats = supervisor?.statsOf?.(mapping.id) ?? null;
     return {
         id: mapping.id,
         name: mapping.name,
@@ -43,7 +47,6 @@ export function mappingView(mapping, { supervisor = null } = {}) {
         targetHost: mapping.target_host,
         targetPort: mapping.target_port,
         listenAddress: mapping.listen_address,
-        capacity: mapping.capacity,
         profile: mapping.profile,
         notes: mapping.notes ?? '',
         desiredState: mapping.desired_state,
@@ -54,6 +57,12 @@ export function mappingView(mapping, { supervisor = null } = {}) {
         stoppedAt: mapping.stopped_at ?? null,
         createdAt: mapping.created_at,
         updatedAt: mapping.updated_at,
+        // Live room occupancy: `roomSlots` is what the room says its capacity is,
+        // `roomMembers` how many it currently lists. Both come from the gateway, not
+        // from configuration.
+        roomSlots: stats?.slots ?? 0,
+        roomMembers: stats?.members ?? 0,
+        roomStatsAt: stats?.at ?? null,
         // The upstream room password is never echoed back; the UI shows whether one
         // is set so the operator can tell "no password" from "a password is stored".
         hasPassword: Boolean(mapping.password),
@@ -245,11 +254,12 @@ export function createApiRoutes({ router, auth, datasource, supervisor, config, 
             ? '0.0.0.0'
             : requireListenAddress(body.listenAddress, '监听地址');
         const profile = requireEnum(body.profile ?? 'default', '配置档', MAPPING_PROFILES);
-        const capacity = body.capacity === undefined ? 4 : requirePort(body.capacity, '房间容量');
         const notes = optionalText(body.notes, '备注', { max: 500 });
 
+        // No capacity field: the gateway learns the room's real member_slots once it
+        // has joined, so there is nothing for an operator to type.
         const id = await ds.createMapping({
-            name, localPort, targetHost, targetPort, password, listenAddress, profile, capacity, notes,
+            name, localPort, targetHost, targetPort, password, listenAddress, profile, notes,
         });
         await ds.addEvent({
             mappingId: id,
@@ -288,7 +298,6 @@ export function createApiRoutes({ router, auth, datasource, supervisor, config, 
             fields.listen_address = requireListenAddress(body.listenAddress, '监听地址');
         }
         if (body.profile !== undefined) fields.profile = requireEnum(body.profile, '配置档', MAPPING_PROFILES);
-        if (body.capacity !== undefined) fields.capacity = requirePort(body.capacity, '房间容量');
         if (body.notes !== undefined) fields.notes = optionalText(body.notes, '备注', { max: 500 });
 
         // A running process already has its command line; changing what it dials or
@@ -298,7 +307,7 @@ export function createApiRoutes({ router, auth, datasource, supervisor, config, 
         // "Running" is judged from BOTH the live process and the stored state: a
         // mapping whose process just died is still recorded as running, and applying
         // a port change there would be just as misleading.
-        const restartFields = ['local_port', 'target_host', 'target_port', 'password', 'listen_address', 'profile', 'capacity'];
+        const restartFields = ['local_port', 'target_host', 'target_port', 'password', 'listen_address', 'profile'];
         const running = (supervisor?.isRunning(id) ?? false)
             || row.state === MAPPING_STATE.running
             || row.state === MAPPING_STATE.starting

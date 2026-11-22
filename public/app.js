@@ -557,7 +557,7 @@ async function viewMappings(main) {
     }
 
     const rows = mappings.map((row) => mappingRow(row, { canEdit }));
-    const table = h('table', { style: 'min-width:900px' },
+    const table = h('table', { style: 'min-width:1000px' },
         h('thead', {}, h('tr', {},
             canEdit ? h('th', { style: 'width:36px' }, '') : null,
             h('th', {}, '名称'),
@@ -565,6 +565,7 @@ async function viewMappings(main) {
             h('th', {}, '目标服务器'),
             h('th', {}, '密码'),
             h('th', {}, '配置档'),
+            h('th', {}, '在线 / 容量'),
             h('th', {}, '状态'),
             h('th', {}, '运行时长 / 原因'),
             h('th', {}, '操作'))),
@@ -652,11 +653,30 @@ function mappingRow(mapping, { canEdit }) {
         h('td', { class: 'mono' }, `${mapping.targetHost}:${mapping.targetPort}`),
         h('td', {}, mapping.hasPassword ? '已设置' : h('span', { class: 'muted' }, '无')),
         h('td', {}, mapping.profile === 'legacy' ? 'legacy' : '标准'),
+        h('td', { class: 'num' }, roomOccupancy(mapping)),
         h('td', {}, badgeFor(mapping.state)),
         h('td', {}, running
             ? fmtDuration(mapping.startedAt)
             : h('span', { class: 'muted' }, mapping.failure || '—')),
         actions);
+}
+
+/**
+ * What the room itself reports: `在线/容量`.
+ *
+ * The capacity is never typed by anyone -- the gateway learns it from the room after
+ * joining. Until that answer arrives, or while the mapping is stopped, the numbers
+ * are honestly shown as unknown rather than filled with a default.
+ */
+function roomOccupancy(mapping) {
+    if (mapping.state !== 'running') return h('span', { class: 'muted' }, '—');
+    if (!mapping.roomSlots) {
+        // Joined count may already be known while the room's capacity is not.
+        return mapping.roomMembers
+            ? h('span', { title: '房间还没报告容量' }, `${mapping.roomMembers}/?`)
+            : h('span', { class: 'muted' }, '连接中…');
+    }
+    return `${mapping.roomMembers}/${mapping.roomSlots}`;
 }
 
 async function mappingAction(mapping, action) {
@@ -725,7 +745,6 @@ function openMappingDialog(mapping) {
         h('option', { value: 'default' }, '标准（完整翻译）'),
         h('option', { value: 'legacy' }, 'legacy（仅数据面）'));
     profile.value = mapping?.profile === 'legacy' ? 'legacy' : 'default';
-    const capacity = h('input', { type: 'number', value: mapping?.capacity ?? 4, min: 1, max: 64 });
     const notes = h('textarea', { placeholder: '可选，例如负责的公会' }, mapping?.notes ?? '');
     const errorBox = h('div', { hidden: true });
 
@@ -738,7 +757,6 @@ function openMappingDialog(mapping) {
                 targetHost: targetHost.value.trim(),
                 targetPort: targetPort.value,
                 profile: profile.value,
-                capacity: capacity.value,
                 notes: notes.value,
             };
             // Only send the port when it was typed; an empty field means "allocate one"
@@ -775,9 +793,8 @@ function openMappingDialog(mapping) {
             h('div', { class: 'field' }, h('label', {}, '目标服务器地址'), targetHost,
                 h('span', { class: 'sub' }, 'IPv4 或域名，不要带端口')),
             h('div', { class: 'field' }, h('label', {}, '房间密码'), password),
-            h('div', { class: 'field-row' },
-                h('div', { class: 'field' }, h('label', {}, '配置档'), profile),
-                h('div', { class: 'field' }, h('label', {}, '房间容量'), capacity)),
+            h('div', { class: 'field' }, h('label', {}, '配置档'), profile,
+                h('span', { class: 'sub' }, '标准＝完整 MHXX/MHGU 翻译；legacy＝仅数据面转发，作为翻译层出问题时的退路')),
             h('div', { class: 'field' }, h('label', {}, '备注'), notes),
             h('div', { class: 'dialog-actions' },
                 h('button', { type: 'button', onClick: () => { dialog.close(); dialog.remove(); } }, '取消'),

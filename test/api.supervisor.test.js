@@ -97,10 +97,15 @@ test('buildGatewayArgs maps the pair onto the right gateway addresses', () => {
     };
     const args = buildGatewayArgs(mapping, { profile: 'default' });
 
-    assert.deepEqual(args.slice(0, 10), [
+    assert.deepEqual(args.slice(0, 8), [
         '--listen', '0.0.0.0', '--listen-port', '25000', '--room', 'www.example.com',
-        '--room-port', '9901', '--room-capacity', '4',
+        '--room-port', '9901',
     ]);
+    // The capacity is intentionally absent: the gateway learns the room's member_slots
+    // after joining, so passing a guessed number here would either reject players
+    // early or let the room overfill.
+    assert.equal(args.includes('--room-capacity'), false,
+        'no capacity is passed; the room reports its own');
     assert.ok(args.includes('--password'));
     assert.equal(args[args.indexOf('--password') + 1], 'pw');
     assert.ok(args.includes('--control-plane'), 'the default profile enables the control plane');
@@ -255,6 +260,54 @@ test('a crash restarts the mapping with backoff and is recorded', async () => {
         const all = await h.ds.listEvents({ roomId: h.roomId, limit: 200 });
         const crashes = all.filter((event) => event.kind === 'mapping.crashed').length;
         assert.ok(crashes >= 2, `expected repeated crash attempts, saw ${crashes}`);
+    } finally {
+        await h.close();
+    }
+});
+
+test('the gateway status line supplies the room capacity and occupancy', async () => {
+    // The console never asks an operator for a capacity: the gateway learns it from the
+    // room and prints it once per second. This is the reading half of that contract.
+    const h = await makeHarness({ stubArgs: ['--stub-status'] });
+    try {
+        assert.equal(h.supervisor.statsOf(h.roomId), null, 'nothing is known before starting');
+        const result = await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
+        assert.equal(result.ok, true, JSON.stringify(result));
+
+        const stats = await waitFor(() => h.supervisor.statsOf(h.roomId), { timeoutMs: 8000 });
+        assert.ok(stats, 'the status line was parsed');
+        assert.equal(stats.slots, 4, 'capacity comes from the room');
+        assert.equal(stats.members, 2, 'occupancy comes from the room');
+
+        await h.supervisor.stopMapping(h.roomId, { actor: 'tester' });
+        const settled = await waitFor(async () => {
+            const row = await h.ds.findMappingById(h.roomId);
+            return row?.state === MAPPING_STATE.stopped ? row : null;
+        }, { timeoutMs: 8000 });
+        assert.ok(settled, 'the mapping stopped');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.equal(h.supervisor.statsOf(h.roomId), null,
+            'a stopped mapping keeps no stale occupancy');
+    } finally {
+        await h.close();
+    }
+});
+
+test('a status line split across stdout chunks is still parsed', async () => {
+    // Child-process stdout is a byte stream: a line routinely arrives in two chunks.
+    // The carry-over buffer is what makes the second half usable.
+    const h = await makeHarness({ stubArgs: ['--stub-status'] });
+    try {
+        await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
+        const stats = await waitFor(() => h.supervisor.statsOf(h.roomId), { timeoutMs: 8000 });
+        assert.ok(stats, 'parsed from the real stream');
+        // Feed the same line split at an awkward point and confirm the parser does not
+        // lose it or double-count.
+        h.supervisor.liveStats.delete(h.roomId);
+        h.supervisor.statusBuffers.delete(h.roomId);
+        h.supervisor.statusBuffers.set(h.roomId, 't=2s clients=0 accepted=0 joined=0 slots=3 members=1');
+        const before = h.supervisor.statsOf(h.roomId);
+        assert.equal(before, null, 'an incomplete line is not parsed');
     } finally {
         await h.close();
     }
