@@ -206,9 +206,9 @@ docker compose --profile mysql up -d --build
 
 | 场景 | 二进制 | 是否需要你操心 |
 | --- | --- | --- |
-| **Docker 镜像** | 镜像内 `/app/bin/citra-gateway`（Linux，1.1 MB，已 strip） | 不用。`docker run` 起来就能直接启动映射，不需要挂载任何东西 |
-| **Windows 本机** | `bin/citra-gateway.exe` | 把 `citra-gateway.exe` 放进 `bin/`。仓库不跟踪它（23 MB），但路径约定就是它 |
-| **Linux 非容器** | `bin/citra-gateway`（仓库内已带的一个构建） | 直接可用；发行版 glibc 差异大时自己重编一个替换 |
+| **Docker 镜像** | 镜像内 `/app/bin/citra-gateway`（Linux，1.0 MB，已 strip） | 不用。`docker run` 起来就能直接启动映射，不需要挂载任何东西 |
+| **Windows 本机** | `bin/citra-gateway.exe`（23 MB） | 不用，仓库自带，clone 下来就能启动映射 |
+| **Linux 非容器** | `bin/citra-gateway`（同上那个 Linux 构建） | 不用，仓库自带 |
 
 想用别的构建（自编译、别的架构、别的路径），只改配置：
 
@@ -219,6 +219,8 @@ docker compose --profile mysql up -d --build
 `binaryPath` 填了就以它为准；文件不存在时 `--check` 会明确说「`gateways.binaryPath` 不存在」，而不是静默回落到 `bin/`。
 
 > 镜像里那个二进制是在 `debian:bookworm` 容器里编译的（和镜像基础镜像同一个 glibc），所以不会出现「编译机能跑、镜像里报 `GLIBC_2.38 not found`」的错配。它的动态依赖只有 `libzstd1`，镜像已装。
+>
+> 两个平台的二进制都在仓库里（Windows 23 MB / Linux 1 MB），并且 `.gitattributes` 把它们显式标成 `binary`。这一步是必须的：如果不标，git 会把它们当 `text: auto`，靠嗅探 NUL 字节来决定，一旦发生行尾替换，运行时就变成 `cannot execute binary file`，而 git 里看不出任何异常。
 
 控制台本身不包含协议翻译，它调用 `citra-gateway` 可执行文件。按下面顺序查找：
 
