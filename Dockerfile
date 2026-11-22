@@ -90,7 +90,9 @@ EXPOSE 8720
 
 VOLUME ["/data"]
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# The console is ready in about a second, so a 15s interval reports reality
+# quickly without generating meaningful load (one tiny HTTP request per probe).
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD node -e "fetch('http://127.0.0.1:'+(process.env.MHGA_PORT||8720)+'/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
