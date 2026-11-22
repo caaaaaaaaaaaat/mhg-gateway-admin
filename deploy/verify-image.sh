@@ -209,6 +209,16 @@ printf '%s' "$ROOMS2" | grep -q '验证服务器' && ck 1 "重建后房间与服
 EV="$(curl -s -b "$JAR2" "$BASE/api/events?limit=100")"
 printf '%s' "$EV" | grep -q 'room.start.refused' && ck 1 "重建后审计事件仍在" || ck 0 "重建后审计事件仍在"
 
+say "前端"
+# The image must not ship an unparseable front end. A syntax error here is a blank
+# page for every user, and it is invisible to HTTP-level checks because the file is
+# still served with 200 -- so parse it inside the container with the real parser.
+D exec "$NAME" node --check /app/public/app.js >/dev/null 2>&1 \
+    && ck 1 "镜像内 app.js 可被 JavaScript 解析" || ck 0 "镜像内 app.js 可被 JavaScript 解析"
+# And the module must actually build its first screen, not just parse.
+D exec "$NAME" sh -c 'grep -q "getElementById(.app.)" /app/public/app.js' >/dev/null 2>&1 \
+    && ck 1 "镜像内 app.js 挂载点与页面一致" || ck 0 "镜像内 app.js 挂载点与页面一致"
+
 say "数据源"
 D exec "$NAME" node -e "import('mysql2/promise').then(m=>process.exit(typeof m.createPool==='function'?0:1)).catch(()=>process.exit(1))" \
     >/dev/null 2>&1 && ck 1 "镜像内 mysql2 可加载（可切 MySQL）" || ck 0 "镜像内 mysql2 可加载"
