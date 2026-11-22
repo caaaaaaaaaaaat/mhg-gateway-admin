@@ -160,11 +160,31 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H "x-csrf-token: $CSRF
     -X POST "$BASE/api/mappings" -d '{"targetHost":"127.0.0.1","targetPort":1,"localPort":25000}')"
 ck "$([ "$CODE" = "409" ] && echo 1 || echo 0)" "重复本地端口被拒绝 (409)"
 
+say "镜像自带的网关"
+# The image ships bin/citra-gateway, so a mapping must start with nothing mounted.
+[ -x /dev/null ] # no-op to keep `set -e` happy across shells
+D exec "$NAME" test -x /app/bin/citra-gateway >/dev/null 2>&1 \
+    && ck 1 "镜像内 /app/bin/citra-gateway 存在且可执行" \
+    || ck 0 "镜像内 /app/bin/citra-gateway 存在且可执行"
+BIN_SIZE="$(D exec "$NAME" stat -c '%s' /app/bin/citra-gateway 2>/dev/null || echo 0)"
+ck "$([ "${BIN_SIZE:-0}" -gt 500000 ] && echo 1 || echo 0)" "网关二进制大小合理 (${BIN_SIZE} bytes)"
+# Its only non-base dependency; a missing one shows up as a load error, not a start.
+D exec "$NAME" ldd /app/bin/citra-gateway 2>&1 | grep -q "not found" \
+    && ck 0 "网关动态库齐全" || ck 1 "网关动态库齐全"
+
 CODE="$(curl -s -b "$JAR" -H "x-csrf-token: $CSRF" -o "$DATA/.start.json" -w '%{http_code}' \
     -X POST "$BASE/api/mappings/$MID/start")"
-# Without a Linux gateway binary inside the image, Start must refuse honestly.
-ck "$([ "$CODE" = "409" ] && echo 1 || echo 0)" "无网关二进制时启动如实拒绝 (409)"
-grep -q 'citra-gateway' "$DATA/.start.json" 2>/dev/null && ck 1 "拒绝原因指向 citra-gateway" || note "拒绝信息: $(head -c 200 "$DATA/.start.json" 2>/dev/null)"
+ck "$([ "$CODE" = "200" ] && echo 1 || echo 0)" "镜像内自带网关，映射启动成功 (200)" \
+    || note "启动响应: $(head -c 300 "$DATA/.start.json" 2>/dev/null)"
+sleep 4
+LOGJ="$(curl -s -b "$JAR" "$BASE/api/mappings/$MID/log?lines=40")"
+printf '%s' "$LOGJ" | grep -q 'gateway listening on 0.0.0.0:25000' \
+    && ck 1 "日志显示网关在容器内监听 0.0.0.0:25000" \
+    || note "日志: $(printf '%s' "$LOGJ" | head -c 300)"
+MAPS0="$(curl -s -b "$JAR" "$BASE/api/mappings")"
+printf '%s' "$MAPS0" | grep -q '"state":"running"' \
+    && ck 1 "映射状态为 running" || ck 0 "映射状态为 running"
+curl -s -o /dev/null -b "$JAR" -H "x-csrf-token: $CSRF" -X POST "$BASE/api/mappings/$MID/stop"
 
 say "数据卷与进程"
 [ -f "$DATA/mhg-gateway-admin.db" ] && ck 1 "数据库在 /data 卷上" || ck 0 "数据库在 /data 卷上"
@@ -216,7 +236,7 @@ printf '%s' "$MAPS2" | grep -q '"localPort":25000' && ck 1 "重建后本地端�
 printf '%s' "$MAPS2" | grep -q '"targetHost":"www.okuapi.xyz"' && ck 1 "重建后目标服务器地址仍在" || ck 0 "重建后目标服务器地址仍在"
 printf '%s' "$MAPS2" | grep -q '"targetPort":9901' && ck 1 "重建后目标端口保持原样" || ck 0 "重建后目标端口保持原样"
 EV="$(curl -s -b "$JAR2" "$BASE/api/events?limit=100")"
-printf '%s' "$EV" | grep -q 'mapping.start.refused' && ck 1 "重建后审计事件仍在" || ck 0 "重建后审计事件仍在"
+printf '%s' "$EV" | grep -q 'mapping.started' && ck 1 "重建后审计事件仍在" || ck 0 "重建后审计事件仍在"
 
 say "前端"
 # The image must not ship an unparseable front end. A syntax error here is a blank

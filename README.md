@@ -26,7 +26,7 @@
 
 容器页面还在**真实浏览器**里验证过（真实镜像 → 真实容器 → Chrome）：首次打开渲染初始化表单、提交后要求重新登录、登录后进入控制台、6 个页面逐个打开并渲染、退出回到登录页，全程控制台零报错（包括 CSP）。
 
-唯一无法在这里完成的是**真实网关二进制联机**：需要 Linux 版 `citra-gateway`。
+唯一无法在这里完成的是**真实网关二进制联机**：需要一台真实的房间服务器和 Citra 客户端互相连，这一环只能由你来试。
 
 ---
 
@@ -202,6 +202,24 @@ docker compose --profile mysql up -d --build
 
 ## 网关程序放在哪里
 
+**默认就是 `bin/`，不需要配置。** 查找顺序：配置里的 `gateways.binaryPath`（如果填了）→ `gateways.binSearchPaths`（默认 `bin`）。
+
+| 场景 | 二进制 | 是否需要你操心 |
+| --- | --- | --- |
+| **Docker 镜像** | 镜像内 `/app/bin/citra-gateway`（Linux，1.1 MB，已 strip） | 不用。`docker run` 起来就能直接启动映射，不需要挂载任何东西 |
+| **Windows 本机** | `bin/citra-gateway.exe` | 把 `citra-gateway.exe` 放进 `bin/`。仓库不跟踪它（23 MB），但路径约定就是它 |
+| **Linux 非容器** | `bin/citra-gateway`（仓库内已带的一个构建） | 直接可用；发行版 glibc 差异大时自己重编一个替换 |
+
+想用别的构建（自编译、别的架构、别的路径），只改配置：
+
+```json
+{ "gateways": { "binaryPath": "/opt/my-gateway/citra-gateway" } }
+```
+
+`binaryPath` 填了就以它为准；文件不存在时 `--check` 会明确说「`gateways.binaryPath` 不存在」，而不是静默回落到 `bin/`。
+
+> 镜像里那个二进制是在 `debian:bookworm` 容器里编译的（和镜像基础镜像同一个 glibc），所以不会出现「编译机能跑、镜像里报 `GLIBC_2.38 not found`」的错配。它的动态依赖只有 `libzstd1`，镜像已装。
+
 控制台本身不包含协议翻译，它调用 `citra-gateway` 可执行文件。按下面顺序查找：
 
 1. 配置项 `gateways.binaryPath`（填绝对路径）
@@ -218,7 +236,7 @@ chmod +x bin/citra-gateway
 node src/index.js --check    # 应该显示「网关程序: .../bin/citra-gateway」
 ```
 
-**在 Linux 容器里运行需要 Linux 版本的二进制。** 上游项目当前的构建脚本面向 Windows（MinGW），要在容器里管理真实房间，需要一个 Linux/musl 静态链接的 `citra-gateway`。没有它控制台的其它功能（账户、配置、审计、端口规划）照常工作，只是点「启动」会明确提示找不到程序。
+**镜像里已经带好 Linux 版了**（`/app/bin/citra-gateway`），不需要你另外提供。上游构建脚本原本只面向 Windows（MinGW），这一版把平台差异做了条件编译，所以 Linux 也能构建；而且产物是在 `debian:bookworm` 容器里编的，glibc 与镜像基础一致，不会出现「编译机能跑、镜像里报 GLIBC 版本不匹配」。Windows 本机用 `bin/citra-gateway.exe`，路径约定相同。
 
 ---
 
@@ -682,7 +700,7 @@ docker run --rm -v mhg-admin-data:/data -v "$PWD":/backup alpine \
 
 **点「启动」提示找不到 citra-gateway**
 - 照 [网关程序放在哪里](#网关程序放在哪里) 放好，再跑 `--check` 确认
-- Docker：确认挂载了 `/app/bin/citra-gateway` 且可执行
+- Docker：镜像自带 `/app/bin/citra-gateway`；只有在配置里改过 `gateways.binaryPath` 时才需要确认那个路径存在且可执行
 
 **房间显示「异常」并快速失败**
 - 看该映射日志（映射列表 → 日志）。常见原因：目标服务器地址/端口不对、密码错、本地端口被别的程序占用
