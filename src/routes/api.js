@@ -16,6 +16,7 @@ import {
     requireId, requireEnum, requireListenAddress,
 } from '../lib/validate.js';
 import { allocatePort, MAPPING_STATE } from '../lib/supervisor.js';
+import { ABOUT } from '../lib/about.js';
 
 const MAPPING_PROFILES = ['default', 'dual-host', 'legacy'];
 
@@ -141,6 +142,17 @@ export function createApiRoutes({ router, auth, datasource, supervisor, config, 
      * is signed in, and the CSRF token if so. One request on page load replaces a
      * round trip for every page.
      */
+    /**
+     * Build identity for the Settings > About card.
+     *
+     * Public on purpose: the operator who set the console up already has an account,
+     * but a colleague who opens the URL before signing in should still be able to see
+     * which build is deployed and where the source lives. Nothing here is secret.
+     */
+    router.get('/api/about', { public: true }, async (req, res) => {
+        sendJson(res, 200, { data: ABOUT });
+    });
+
     router.get('/api/session', { public: true }, async (req, res) => {
         const setupComplete = await auth.isSetupComplete();
         const context = setupComplete ? await auth.authenticate(req) : null;

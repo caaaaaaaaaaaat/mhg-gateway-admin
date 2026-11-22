@@ -239,6 +239,51 @@ test('every view function can be called without throwing', async () => {
     }
 });
 
+test('the About card names the author and links the repository', async () => {
+    const session = {
+        setupComplete: true, authenticated: true, csrfToken: 't',
+        user: { id: 1, username: 'admin', role: 'owner' },
+    };
+    const app = await runApp({
+        routes: {
+            'GET /api/session': { body: { data: session } },
+            'GET /api/about': {
+                body: {
+                    data: {
+                        name: 'MHXX/MHGU 网关批量管理控制台',
+                        version: '0.1.0',
+                        author: '小忆',
+                        qq: '1726956536',
+                        qqGroup: '741115244',
+                        repo: 'https://github.com/caaaaaaaaaaaat/mhg-gateway-admin',
+                        license: 'GPL-3.0-or-later',
+                    },
+                },
+            },
+            'GET /api/diagnostics': {
+                body: {
+                    data: {
+                        datasource: 'sqlite', localPortRange: [25000, 25999],
+                        usedLocalPorts: [], nodeVersion: 'v22.20.0',
+                    },
+                },
+            },
+        },
+    });
+    const target = app.document.createElement('div');
+    await app.sandbox.viewSettings(target);
+    const text = target.textContent;
+    assert.match(text, /小忆/, '作者');
+    assert.match(text, /1726956536/, 'QQ');
+    assert.match(text, /741115244/, 'QQ 群');
+    assert.match(text, /0\.1\.0/, '版本来后端');
+    const link = [...target.querySelectorAll('a')]
+        .find((node) => String(node.getAttribute('href') ?? '').includes('mhg-gateway-admin'));
+    assert.ok(link, '仓库链接存在');
+    assert.equal(link.getAttribute('target'), '_blank');
+    assert.match(String(link.getAttribute('rel') ?? ''), /noopener/, '外链带 noopener');
+});
+
 test('non-owner accounts do not get destructive controls', async () => {
     const session = {
         setupComplete: true, authenticated: true, csrfToken: 't',

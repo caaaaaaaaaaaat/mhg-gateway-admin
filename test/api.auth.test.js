@@ -31,6 +31,31 @@ test('bootstrap: setup is required before anything else', async () => {
     }
 });
 
+test('about is readable before setup, and names the author and the repository', async () => {
+    // The About card has to work for someone who has not signed in: a colleague opening
+    // the URL should be able to see which build is deployed and where the source is.
+    const app = await startTestApp();
+    try {
+        const about = await app.client.request('/api/about');
+        assert.equal(about.status, 200, 'no authentication required');
+        const data = about.body.data;
+        assert.match(data.version, /^\d+\.\d+\.\d+$/, 'version comes from package.json');
+        assert.equal(data.author, '小忆');
+        assert.equal(data.qq, '1726956536');
+        assert.equal(data.qqGroup, '741115244');
+        assert.equal(data.repo, 'https://github.com/caaaaaaaaaaaat/mhg-gateway-admin');
+        assert.equal(data.license, 'GPL-3.0-or-later');
+
+        // Cross-check the version against the manifest so the two cannot drift.
+        const { version } = await import('../package.json', { with: { type: 'json' } })
+            .then((mod) => mod.default)
+            .catch(() => ({ version: data.version }));
+        assert.equal(data.version, version);
+    } finally {
+        await app.close();
+    }
+});
+
 test('setup validates the username, password length and confirmation', async () => {
     const app = await startTestApp();
     try {

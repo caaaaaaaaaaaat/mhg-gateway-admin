@@ -978,6 +978,9 @@ async function viewSettings(main) {
     const canAdmin = state.session.user.role === 'admin' || state.session.user.role === 'owner';
     const diagnostics = canAdmin ? await api('/api/diagnostics') : null;
     state.diagnostics = diagnostics;
+    // Public endpoint: the About card must render for a non-admin (or a colleague who
+    // has not signed in yet), so it cannot ride on /api/diagnostics.
+    const about = await api('/api/about').catch(() => null);
 
     const blocks = [];
 
@@ -1050,10 +1053,33 @@ async function viewSettings(main) {
             h('div', { class: 'table-wrap' }, infoTable)));
     }
 
+    // ---- about: build identity + author ----
+    // Mirrors the desktop gateway's About window: the same author line, the same
+    // contact entries, and a link to this project's repository. The values come from
+    // /api/about so the version has one source (package.json) and the panel does not
+    // hard-code a number that drifts from the build.
+    const aboutRows = [];
+    if (about) {
+        const aboutCell = (label, content) => h('tr', {},
+            h('td', { style: 'width:110px;color:var(--muted)' }, label),
+            h('td', {}, content));
+        aboutRows.push(aboutCell('版本', h('span', { class: 'mono' }, about.version)));
+        aboutRows.push(aboutCell('作者', about.author));
+        aboutRows.push(aboutCell('QQ', h('span', { class: 'mono' }, about.qq)));
+        aboutRows.push(aboutCell('QQ 群', h('span', { class: 'mono' }, about.qqGroup)));
+        aboutRows.push(aboutCell('开源仓库',
+            h('a', { href: about.repo, target: '_blank', rel: 'noopener noreferrer' }, about.repo)));
+        aboutRows.push(aboutCell('许可', h('span', { class: 'mono' }, about.license)));
+    }
+    const aboutTable = aboutRows.length
+        ? h('div', { class: 'table-wrap' }, h('table', { style: 'min-width:420px' }, h('tbody', {}, aboutRows)))
+        : null;
+
     blocks.push(h('section', { class: 'card' },
         h('div', { class: 'card-head' },
             h('div', {}, h('h2', {}, '关于'),
                 h('p', { class: 'hint' }, 'MHXX/MHGU 网关批量管理控制台，用于在服务器上管理多个房间网关进程。'))),
+        aboutTable,
         h('p', { class: 'small muted' },
             '房间的协议翻译由 citra-gateway 完成；本控制台只负责进程生命周期、端口分配与配置存放。' +
             '带密码的房间不会把密码回显给浏览器，也不会写入日志。')));

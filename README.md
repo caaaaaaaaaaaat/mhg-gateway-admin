@@ -595,6 +595,7 @@ sudo journalctl -u mhg-gateway-admin -f
 | 方法 | 路径 | 角色 | 说明 |
 |---|---|---|---|
 | GET | `/api/health` | 公开 | 探活，`/healthz` 同义 |
+| GET | `/api/about` | 公开 | 构建信息：版本、作者、QQ/QQ 群、开源仓库。设置页「关于」卡片的数据源；不用登录也能看，方便确认线上部署的是哪一版 |
 | GET | `/api/session` | 公开 | 是否已初始化、是否已登录、CSRF token、网关程序是否就绪 |
 | POST | `/api/setup` | 公开 | 创建首个管理员（仅一次） |
 | POST | `/api/login` | 公开 | 登录，返回 `csrfToken` |
