@@ -37,3 +37,8 @@ Thumbs.db
 *.tar
 *.tar.gz
 mhg-gateway-admin-*.tar
+
+# Local gateway binaries. README tells the operator to drop a citra-gateway
+# build into bin/; a 23 MB executable must never enter the source history.
+/bin/*
+!/bin/.gitkeep

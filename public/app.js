@@ -92,7 +92,14 @@ function h(tag, props = {}, ...children) {
         if (key === 'class') element.className = value;
         else if (key === 'text') element.textContent = value;
         else if (key === 'html') element.innerHTML = value; // only for trusted static markup
-        else if (key.startsWith('on') && typeof value === 'function') {
+        else if (key === 'style') {
+            // Assign through CSSOM, not setAttribute('style', ...). The page ships a
+            // strict `style-src 'self'` policy, which blocks inline style attributes:
+            // going through the attribute silently drops every layout tweak the views
+            // rely on (and logs a CSP violation). CSSOM writes are not inline styles,
+            // so the strict policy can stay.
+            element.style.cssText = String(value);
+        } else if (key.startsWith('on') && typeof value === 'function') {
             element.addEventListener(key.slice(2).toLowerCase(), value);
         } else if (key === 'dataset') {
             Object.assign(element.dataset, value);
@@ -494,18 +501,19 @@ async function viewDashboard(main) {
     }
 
     if (data.events.length > 0) {
+        const eventRows = data.events.slice(0, 12).map((event) => h('tr', {},
+            h('td', { class: 'nowrap' }, fmtTime(event.at)),
+            h('td', { class: 'mono' }, event.kind),
+            h('td', {}, event.detail || '—'),
+            h('td', {}, event.actor || '—')));
+        const eventTable = h('table', { style: 'min-width:560px' },
+            h('thead', {}, h('tr', {}, h('th', {}, '时间'), h('th', {}, '事件'), h('th', {}, '详情'), h('th', {}, '操作者'))),
+            h('tbody', {}, eventRows));
         blocks.push(h('section', { class: 'card' },
             h('div', { class: 'card-head' },
                 h('div', {}, h('h2', {}, '最近事件'),
                     h('p', { class: 'hint' }, '启动、停止、异常退出与配置改动都会记录在这里。'))),
-            h('div', { class: 'table-wrap' },
-                h('table', { style: 'min-width:560px' },
-                    h('thead', {}, h('tr', {}, h('th', {}, '时间'), h('th', {}, '事件'), h('th', {}, '详情'), h('th', {}, '操作者'))),
-                    h('tbody', {}, data.events.slice(0, 12).map((event) => h('tr', {},
-                        h('td', { class: 'nowrap' }, fmtTime(event.at)),
-                        h('td', { class: 'mono' }, event.kind),
-                        h('td', {}, event.detail || '—'),
-                        h('td', {}, event.actor || '—'))))))));
+            h('div', { class: 'table-wrap' }, eventTable)));
     }
 
     blocks.push(h('p', { class: 'small muted' },
@@ -876,37 +884,46 @@ async function viewServers(main) {
         h('div', { class: 'btn-row' },
             canEdit ? h('button', { class: 'primary', onClick: () => openServerDialog(null) }, '添加服务器') : null));
 
-    const body = servers.length === 0
-        ? h('div', { class: 'empty' },
+    // Built with named intermediates rather than one deeply nested expression: the
+    // nested form had six closing parentheses in a row and shipped with five, which
+    // is a syntax error that only appears when the browser parses this file.
+    let body;
+    if (servers.length === 0) {
+        body = h('div', { class: 'empty' },
             h('strong', {}, '还没有房间服务器'),
-            h('p', {}, '先添加一台 yuzu-room 服务器，之后创建房间时选择它。'))
-        : h('div', { class: 'table-wrap' },
+            h('p', {}, '先添加一台 yuzu-room 服务器，之后创建房间时选择它。'));
+    } else {
+        const rows = servers.map((server) => {
+            const actions = h('td', { class: 'actions' },
+                canEdit ? h('button', { class: 'small', onClick: () => openServerDialog(server) }, '编辑') : null,
+                canEdit ? h('button', {
+                    class: 'small danger',
+                    onClick: async () => {
+                        if (!confirm(`确定要删除服务器“${server.name}”吗？`)) return;
+                        try {
+                            await api(`/api/servers/${server.id}`, { method: 'DELETE' });
+                            toast('服务器已删除');
+                            await viewServers(main);
+                        } catch (error) {
+                            fail(error);
+                        }
+                    },
+                }, '删除') : null);
+            return h('tr', {},
+                h('td', { style: 'font-weight:600' }, server.name),
+                h('td', { class: 'mono' }, server.host),
+                h('td', { class: 'num' }, String(server.port)),
+                h('td', {}, server.hasPassword ? '已设置' : h('span', { class: 'muted' }, '无')),
+                h('td', {}, server.notes || h('span', { class: 'muted' }, '—')),
+                actions);
+        });
+        body = h('div', { class: 'table-wrap' },
             h('table', { style: 'min-width:620px' },
                 h('thead', {}, h('tr', {},
                     h('th', {}, '名称'), h('th', {}, '地址'), h('th', {}, '端口'),
                     h('th', {}, '密码'), h('th', {}, '备注'), h('th', {}, canEdit ? '操作' : ''))),
-                h('tbody', {}, servers.map((server) => h('tr', {},
-                    h('td', { style: 'font-weight:600' }, server.name),
-                    h('td', { class: 'mono' }, server.host),
-                    h('td', { class: 'num' }, String(server.port)),
-                    h('td', {}, server.hasPassword ? '已设置' : h('span', { class: 'muted' }, '无')),
-                    h('td', {}, server.notes || h('span', { class: 'muted' }, '—')),
-                    h('td', { class: 'actions' },
-                        canEdit ? h('button', { class: 'small', onClick: () => openServerDialog(server) }, '编辑') : null,
-                        canEdit ? h('button', {
-                            class: 'small danger',
-                            onClick: async () => {
-                                if (!confirm(`确定要删除服务器“${server.name}”吗？`)) return;
-                                try {
-                                    await api(`/api/servers/${server.id}`, { method: 'DELETE' });
-                                    toast('服务器已删除');
-                                    await viewServers(main);
-                                } catch (error) {
-                                    fail(error);
-                                }
-                            },
-                        }, '删除') : null)))))
-        ;
+                h('tbody', {}, rows)));
+    }
 
     main.replaceChildren(h('section', { class: 'card' }, head, body));
 }
@@ -1018,38 +1035,43 @@ async function viewUsers(main) {
         h('div', { class: 'btn-row' },
             isOwner ? h('button', { class: 'primary', onClick: () => openUserDialog() }, '添加账户') : null));
 
+    const rows = users.map((user) => {
+        const status = user.disabled
+            ? h('span', { class: 'badge failed' }, '已禁用')
+            : user.lockedUntil && user.lockedUntil > Date.now()
+                ? h('span', { class: 'badge failed' }, '锁定中')
+                : h('span', { class: 'badge running' }, '正常');
+        const actions = user.role === 'owner'
+            ? h('span', { class: 'small muted' }, '拥有者')
+            : h('button', {
+                class: 'small danger',
+                onClick: async () => {
+                    if (!confirm(`确定要删除账户“${user.username}”吗？`)) return;
+                    try {
+                        await api(`/api/users/${user.id}`, { method: 'DELETE' });
+                        toast('账户已删除');
+                        await viewUsers(main);
+                    } catch (error) {
+                        fail(error);
+                    }
+                },
+            }, '删除');
+        return h('tr', {},
+            h('td', { style: 'font-weight:600' }, user.username),
+            h('td', {}, roleLabel(user.role)),
+            h('td', { class: 'nowrap' }, fmtTime(user.lastLoginAt)),
+            h('td', { class: 'nowrap' }, fmtTime(user.createdAt)),
+            h('td', {}, status),
+            h('td', { class: 'actions' }, actions));
+    });
+
+    const table = h('table', { style: 'min-width:620px' },
+        h('thead', {}, h('tr', {},
+            h('th', {}, '账户'), h('th', {}, '角色'), h('th', {}, '最近登录'),
+            h('th', {}, '创建时间'), h('th', {}, '状态'), h('th', {}, '操作'))),
+        h('tbody', {}, rows));
     main.replaceChildren(h('section', { class: 'card' }, head,
-        h('div', { class: 'table-wrap' },
-            h('table', { style: 'min-width:620px' },
-                h('thead', {}, h('tr', {},
-                    h('th', {}, '账户'), h('th', {}, '角色'), h('th', {}, '最近登录'),
-                    h('th', {}, '创建时间'), h('th', {}, '状态'), h('th', {}, '操作'))),
-                h('tbody', {}, users.map((user) => h('tr', {},
-                    h('td', { style: 'font-weight:600' }, user.username),
-                    h('td', {}, roleLabel(user.role)),
-                    h('td', { class: 'nowrap' }, fmtTime(user.lastLoginAt)),
-                    h('td', { class: 'nowrap' }, fmtTime(user.createdAt)),
-                    h('td', {}, user.disabled
-                        ? h('span', { class: 'badge failed' }, '已禁用')
-                        : user.lockedUntil && user.lockedUntil > Date.now()
-                            ? h('span', { class: 'badge failed' }, '锁定中')
-                            : h('span', { class: 'badge running' }, '正常')),
-                    h('td', { class: 'actions' },
-                        user.role === 'owner'
-                            ? h('span', { class: 'small muted' }, '拥有者')
-                            : h('button', {
-                                class: 'small danger',
-                                onClick: async () => {
-                                    if (!confirm(`确定要删除账户“${user.username}”吗？`)) return;
-                                    try {
-                                        await api(`/api/users/${user.id}`, { method: 'DELETE' });
-                                        toast('账户已删除');
-                                        await viewUsers(main);
-                                    } catch (error) {
-                                        fail(error);
-                                    }
-                                },
-                            }, '删除'))))))))));
+        h('div', { class: 'table-wrap' }, table)));
 }
 
 function openUserDialog() {
@@ -1170,15 +1192,15 @@ async function viewSettings(main) {
             ['运行环境', `${diagnostics.platform} · Node ${diagnostics.nodeVersion}`],
             ['已运行', fmtDuration(Date.now() - diagnostics.uptimeSeconds * 1000)],
         ];
+        const infoRows = rows.map(([label, value]) => h('tr', {},
+            h('td', { style: 'width:150px;color:var(--muted)' }, label),
+            h('td', { class: 'mono' }, value === undefined || value === null ? '—' : String(value))));
+        const infoTable = h('table', { style: 'min-width:520px' }, h('tbody', {}, infoRows));
         blocks.push(h('section', { class: 'card' },
             h('div', { class: 'card-head' },
                 h('div', {}, h('h2', {}, '部署信息'),
                     h('p', { class: 'hint' }, '只读。要修改端口池、数据源或网关路径，请编辑 config.json 后重启服务。'))),
-            h('div', { class: 'table-wrap' },
-                h('table', { style: 'min-width:520px' },
-                    h('tbody', {}, rows.map(([label, value]) => h('tr', {},
-                        h('td', { style: 'width:150px;color:var(--muted)' }, label),
-                        h('td', { class: 'mono' }, value === undefined || value === null ? '—' : String(value)))))))));
+            h('div', { class: 'table-wrap' }, infoTable)));
     }
 
     blocks.push(h('section', { class: 'card' },
