@@ -40,6 +40,12 @@ export const RESTART_POLICY = Object.freeze({
     windowMs: 60_000,
     baseBackoffMs: 1000,
     maxBackoffMs: 30_000,
+    /**
+     * A process that exits non-zero within this window is "refused to start", not
+     * "crashed mid-session". Retrying a bad configuration only repeats the same
+     * failure five times and buries the one useful line in the log.
+     */
+    startupFailureMs: 3000,
 });
 const TAIL_BYTES = 64 * 1024;
 
@@ -414,7 +420,7 @@ export class GatewaySupervisor extends EventEmitter {
             return { ok: false, error: message };
         }
 
-        const entry = { proc, stream, exitTimer: null };
+        const entry = { proc, stream, exitTimer: null, startedAt: Date.now() };
         this.procs.set(mappingId, entry);
 
         // Never log the password itself: it appears in argv, and the log is served
@@ -546,6 +552,34 @@ export class GatewaySupervisor extends EventEmitter {
         }
 
         // Wanted to run but died: bounded restart with a crash-loop fuse.
+        //
+        // A process that dies within a couple of seconds of starting did not "crash
+        // mid-session" -- it refused to start (a bad address, a port already taken, a
+        // missing binary underneath). Restarting that is pure noise: it buries the one
+        // useful line in the log under repeated identical failures, and it looks like
+        // the console is self-healing when nothing will ever succeed. Retrying is only
+        // meaningful once the process actually ran for a while.
+        const livedMs = nowMs() - (entry.startedAt ?? 0);
+        const failedToStart = entry.startedAt !== undefined
+            && livedMs < this.restartPolicy.startupFailureMs
+            && code !== 0;
+        if (failedToStart) {
+            await this.ds.updateMapping(mappingId, {
+                state: MAPPING_STATE.failed,
+                pid: null,
+                failure: `启动即退出（${detail}），已停止自动重试。请检查映射的端口、目标地址或网关程序`,
+                desired_state: 'stopped',
+            });
+            await this.ds.addEvent({
+                mappingId,
+                kind: 'mapping.start.failed',
+                detail: `${detail}（${Math.max(0, Math.round(livedMs / 1000))} 秒内退出，不重试）`,
+                actor: 'system',
+            });
+            this.emit('room', { mappingId, state: MAPPING_STATE.failed });
+            return;
+        }
+
         // The history lives on the supervisor (keyed by room), NOT on `entry`, because
         // every restart builds a fresh entry and would reset the counter forever.
         const now = nowMs();

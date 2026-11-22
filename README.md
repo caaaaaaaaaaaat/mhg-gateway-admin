@@ -474,6 +474,13 @@ if (driver === 'postgres') return new PostgresDatasource(config.storage.postgres
 | `--listen` / `--listen-port` | 映射的 `localPort` / `listenAddress` | **本机**监听的地址和端口（玩家连这里） |
 | `--room` / `--room-port` | 映射的 `targetHost` / `targetPort` | **远端**房间服务器的地址和端口 |
 
+两条容易被卡住的地方，现在已经都不是问题：
+
+- **监听地址可以是 `0.0.0.0`。** 要让局域网或公网玩家连进来，网关必须绑定 `0.0.0.0`（或具体网卡地址）。旧版网关只允许 `127.0.0.1`，命令行也开不了，表现是日志里 `OPEN-FAILED: refusing to listen on a non loopback address: 0.0.0.0`。现在任意 IPv4 绑定都允许。
+- **目标服务器可以填域名。** `www.example.com` 和 `1.2.3.4` 都行，域名由 ENet 在连接时用 getaddrinfo 解析。旧版只收数字 IP。
+
+> 启动即失败不会重试。网关因为配置不对（地址非法、端口被占）会在几秒内退出，控制台把它判为"拒绝启动"，直接标红并给出原因，不再退避重试五次——重试一个必错配置只会把那一行有用的日志埋掉。只有**运行中**的意外退出才走崩溃重启与熔断。
+
 Docker 里这些 UDP 端口是**在容器内监听**的，所以必须用 `-p` 发布出来才能被玩家连到。发布多少个就对应多少个房间。
 
 防火墙示例（ufw）：

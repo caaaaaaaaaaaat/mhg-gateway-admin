@@ -231,7 +231,7 @@ test('a crash restarts the mapping with backoff and is recorded', async () => {
     // A compressed backoff keeps the fuse observable without a minute of waiting.
     const h = await makeHarness({
         stubArgs: ['--stub-exit'],
-        restartPolicy: { maxAttempts: 3, windowMs: 60_000, baseBackoffMs: 60, maxBackoffMs: 200 },
+        restartPolicy: { maxAttempts: 3, windowMs: 60_000, baseBackoffMs: 60, maxBackoffMs: 200, startupFailureMs: 0 },
     });
     try {
         const started = await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
@@ -308,6 +308,40 @@ test('a status line split across stdout chunks is still parsed', async () => {
         h.supervisor.statusBuffers.set(h.roomId, 't=2s clients=0 accepted=0 joined=0 slots=3 members=1');
         const before = h.supervisor.statsOf(h.roomId);
         assert.equal(before, null, 'an incomplete line is not parsed');
+    } finally {
+        await h.close();
+    }
+});
+
+test('a gateway that refuses to start is reported once, not retried', async () => {
+    // The failure this pins down: a bad --listen/--room or a taken port makes the
+    // gateway exit immediately. Treating that as a crash restarts it five times, which
+    // buries the one useful log line and looks like self-healing when nothing can
+    // succeed. Retrying only makes sense once the process actually ran.
+    const h = await makeHarness({ stubArgs: ['--stub-exit'] });
+    try {
+        const result = await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
+        assert.equal(result.ok, true, 'the spawn itself succeeds');
+
+        const failed = await waitFor(async () => {
+            const row = await h.ds.findMappingById(h.roomId);
+            return row?.state === MAPPING_STATE.failed && row?.desired_state === 'stopped' ? row : null;
+        }, { timeoutMs: 8000 });
+        assert.ok(failed, 'the mapping settles as failed and stopped');
+        assert.match(failed.failure, /启动即退出/);
+        assert.match(failed.failure, /已停止自动重试/);
+
+        // Give the restart policy time to prove nothing was scheduled.
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        const events = await h.ds.listEvents({ mappingId: h.roomId, limit: 50 });
+        const attempts = events.filter((event) => event.kind === 'mapping.start.failed');
+        assert.equal(attempts.length, 1, `expected exactly one attempt, saw ${attempts.length}`);
+        assert.equal(events.some((event) => event.kind === 'mapping.crashed'), false,
+            'it was not classified as a crash');
+
+        const log = h.supervisor.readLog(h.roomId, { lines: 50 });
+        const starts = (log.text ?? '').split('\n').filter((line) => line.includes(' start ')).length;
+        assert.equal(starts, 1, `the log must carry one start line, saw ${starts}`);
     } finally {
         await h.close();
     }
@@ -430,7 +464,7 @@ test('stopping an already stopped mapping is a no-op success', async () => {
 test('stop interrupts a scheduled auto-restart', async () => {
     const h = await makeHarness({
         stubArgs: ['--stub-exit'],
-        restartPolicy: { maxAttempts: 5, windowMs: 60_000, baseBackoffMs: 400, maxBackoffMs: 400 },
+        restartPolicy: { maxAttempts: 5, windowMs: 60_000, baseBackoffMs: 400, maxBackoffMs: 400, startupFailureMs: 0 },
     });
     try {
         await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
