@@ -74,6 +74,11 @@ function nowMs() {
  */
 export function buildGatewayArgs(mapping, { profile = mapping.profile ?? 'default' } = {}) {
     const args = [
+        // The gateway's --seconds default is 5 (a self-terminating evidence run). A
+        // managed mapping must live until the console stops it, otherwise the gateway
+        // exits cleanly after five seconds and the supervisor reads that as a crash,
+        // restarting forever with backoff. 0 means "run until stopped".
+        '--seconds', '0',
         '--listen', mapping.listenAddress || mapping.listen_address || '0.0.0.0',
         '--listen-port', String(mapping.localPort ?? mapping.local_port),
         '--room', mapping.targetHost ?? mapping.target_host,

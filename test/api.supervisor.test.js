@@ -97,7 +97,10 @@ test('buildGatewayArgs maps the pair onto the right gateway addresses', () => {
     };
     const args = buildGatewayArgs(mapping, { profile: 'default' });
 
-    assert.deepEqual(args.slice(0, 8), [
+    assert.deepEqual(args.slice(0, 10), [
+        // A supervised gateway must not self-terminate: --seconds defaults to 5 in the
+        // binary, and 0 means "run until stopped".
+        '--seconds', '0',
         '--listen', '0.0.0.0', '--listen-port', '25000', '--room', 'www.example.com',
         '--room-port', '9901',
     ]);
