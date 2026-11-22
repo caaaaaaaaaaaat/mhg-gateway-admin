@@ -56,8 +56,19 @@ export function requireName(value, field, { max = 32 } = {}) {
  */
 export function requireHost(value, field) {
     const text = requireString(value, field, { min: 1, max: 253 });
-    if (text.includes('/') || text.includes('\\') || text.includes(':') && !text.includes(':')) {
-        throw new HttpError(400, `${field} 不能包含协议、路径或端口`, { code: 'invalid_field', details: { field } });
+    if (text.includes('/') || text.includes('\\')) {
+        throw new HttpError(400, `${field} 不能包含协议或路径`, { code: 'invalid_field', details: { field } });
+    }
+    // A port belongs in the separate field. Bare IPv6 addresses legitimately contain
+    // colons, so only forms that cannot be IPv6 are rejected here. An IPv6 literal
+    // always has at least two colons (`::1`, `fe80::1`, `2001:db8::1`); a single
+    // colon is always `host:port`, which the caller must split itself.
+    const colonCount = (text.match(/:/g) ?? []).length;
+    const looksLikeIpv6 = text.startsWith('[') || colonCount >= 2;
+    if (text.includes(':') && !looksLikeIpv6) {
+        throw new HttpError(400, `${field} 不要带端口，端口请填在单独的字段里`, {
+            code: 'invalid_field', details: { field },
+        });
     }
     const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
     const match = ipv4.exec(text);

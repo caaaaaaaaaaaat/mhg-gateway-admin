@@ -167,7 +167,7 @@ async function main() {
     await supervisor.start();
 
     if (args.check) {
-        const rooms = await datasource.listRooms();
+        const rooms = await datasource.listMappings();
         const users = await datasource.countUsers();
         const binary = supervisor.probeBinary();
         process.stdout.write([
@@ -176,7 +176,8 @@ async function main() {
             `  配置文件: ${config.configPath ?? '(使用默认值)'}`,
             `  监听: ${config.server.host}:${config.server.port}`,
             `  管理员: ${users > 0 ? '已初始化' : '尚未初始化 (首次打开网页时设置)'}`,
-            `  房间: ${rooms.length}`,
+            `  端口映射: ${rooms.length} 条`,
+            `  本地端口池: ${config.gateways.localPortRange[0]}-${config.gateways.localPortRange[1]}`,
             `  网关程序: ${binary ?? `未找到 — ${supervisor.binaryError}`}`,
             `  运行目录: ${config.gateways.runtimeDir}`,
             '',

@@ -2,9 +2,9 @@
 
 **MHXX / MHGU 跨平台联机网关的服务器端批量管理控制台。**
 
-把多台 `citra-gateway` 房间网关放在一台服务器上统一管理：网页登录、一条命令批量启动/停止、端口自动分配、每房日志、失败原因可见、账户分级。数据默认落在服务器本地的 SQLite，也可以换成 MySQL。附带 Docker 镜像。
+把多台 `citra-gateway` 房间网关放在一台服务器上统一管理：网页登录、一条命令批量启动/停止、**每个映射占一个你指定的本地端口对应一台你指定的房间服务器**、每条映射日志、失败原因可见、账户分级。数据默认落在服务器本地的 SQLite，也可以换成 MySQL。附带 Docker 镜像。
 
-> 房间的**协议翻译**由 [citra-gateway](../crossplay/citra-gateway/README.md) 完成。本项目只负责进程生命周期、配置存放和网页管理，不修改也不重写协议层。
+> 房间的**协议翻译**由 [citra-gateway](../crossplay/citra-gateway/README.md) 完成。本项目只负责进程生命周期、端口映射、配置存放和网页管理，不修改也不重写协议层。
 
 ## 验证到哪一步了
 
@@ -64,8 +64,8 @@
 
 | 需求 | 本项目 |
 |---|---|
-| 一次开十几个房间 | 一条“批量启动”，端口自动分配，冲突会明确报错 |
-| 多个管理员分别看房间 | 网页登录，账户分「管理员 / 只读」 |
+| 一次开十几个房间 | 一条“批量启动”，每条映射占一个指定的本地端口，端口冲突会明确报错 |
+| 多个管理员分别看映射 | 网页登录，账户分「管理员 / 只读」 |
 | 房间挂了要知道为什么 | 每个房间有状态、失败原因、可读日志，崩溃自动重启并留审计记录 |
 | 重启服务器后不想丢配置 | SQLite 存本地，容器里挂一个 `/data` 卷即可 |
 | 多个站点共用一套管理 | 数据源可换 MySQL |
@@ -195,8 +195,8 @@ docker compose --profile mysql up -d --build
 | 角色 | 能做什么 |
 |---|---|
 | 拥有者 owner | 全部，且不可被删除 |
-| 管理员 admin | 管理服务器/房间/账户，启停房间，看部署信息 |
-| 只读 viewer | 看总览、房间、服务器、事件与日志，不能改任何东西 |
+| 管理员 admin | 管理映射/账户，启停映射，看部署信息 |
+| 只读 viewer | 看总览、映射、事件与日志，不能改任何东西 |
 
 ---
 
@@ -259,8 +259,7 @@ node src/index.js --check    # 应该显示「网关程序: .../bin/citra-gatewa
   "gateways": {
     "binaryPath": "",                          // 空 = 去下面的目录里找
     "binSearchPaths": ["bin", "/usr/local/bin", "/usr/bin"],
-    "citraPortRange": [25000, 25999],          // Citra 侧端口池（玩家连这个）
-    "roomPortRange": [24000, 24999],           // 房间服务端端口池
+    "localPortRange": [25000, 25999],          // 本地端口池：本地端口留空时从这里分配
     "runtimeDir": "data/rooms",                // 每房日志所在目录
     "extraArgs": [],                            // 追加给每个网关的参数（高级）
     "sampleIntervalMs": 2000,                   // 状态采样间隔
@@ -279,14 +278,23 @@ node src/index.js --check    # 应该显示「网关程序: .../bin/citra-gatewa
 
 ```
 配置错误: server.port: must be within 1..65535, got 0
-配置错误: gateways.citraPortRange: low bound must be below high bound
+配置错误: gateways.localPortRange: low bound must be below high bound
 ```
 
-### 端口池怎么规划
+### 一条映射就是一个端口对
 
-- 每个房间占 **一个 Citra 端口**（玩家连）和一个 **房间服务端端口**（网关向房间服务器声明）。
-- 新建房间时留空端口 = 从池里按顺序挑第一个空闲的；填了具体端口 = 用你填的，若被占用会明确报 `port_in_use`。
-- 池子用尽会报 `port_pool_exhausted`，提示你调整 `citraPortRange` / `roomPortRange`。
+整个控制台只有一种对象：**映射**。一条映射就是一对：
+
+```
+本地端口（玩家连这个）  →  目标房间服务器 host:port（网关连这个）
+```
+
+- **本地端口**是玩家在 Citra 里填的 UDP 端口，由你决定。留空时从 `localPortRange` 里挑第一个空闲的；填了就用你填的，被占用会明确报 `port_in_use`。
+- **目标服务器**是该房间服务器自己的地址和端口（例如 `www.okuapi.xyz` + `9901`）。它属于**远端**，不从本地池里分配，也不占用本机端口。
+- 多条映射可以指向**同一台**服务器（不同端口），也可以指向不同服务器；每条各起一个网关进程。
+- 端口池用尽会报 `port_pool_exhausted`，提示你扩大 `localPortRange`。
+
+> 早期版本把这一对拆成「服务器」加「房间」两张表，并且从本地池里给远端端口也分配了一个值，导致网关实际去连 `host:24001` 而不是你填的 `host:9901`。现在这一对存在同一行里，两半不会再走散。
 - **端口池大小要和 Docker 发布的 UDP 端口范围、防火墙规则一致。**
 
 ### 三种配置档 (profile)
@@ -443,8 +451,15 @@ if (driver === 'postgres') return new PostgresDatasource(config.storage.postgres
 | 端口 | 协议 | 用途 | 谁需要能访问 |
 |---|---|---|---|
 | `8720`（可改） | TCP | 管理网页 | 管理员 |
-| `citraPortRange`（默认 25000–25999） | UDP | 每个房间的 Citra 接入端口 | **玩家** |
-| `roomPortRange`（默认 24000–24999） | UDP | 网关向房间服务器声明的端口 | 房间服务器 |
+| `localPortRange`（默认 25000–25999） | UDP | 每条映射的本地接入端口（玩家连这个） | **玩家** |
+| 映射里的 `targetHost:targetPort` | UDP | 远端房间服务器自己的地址和端口 | 网关 → 房间服务器 |
+
+网关命令行里两边的对应关系是固定的，改配置时不要搞反：
+
+| 网关参数 | 来自 | 含义 |
+| --- | --- | --- |
+| `--listen` / `--listen-port` | 映射的 `localPort` / `listenAddress` | **本机**监听的地址和端口（玩家连这里） |
+| `--room` / `--room-port` | 映射的 `targetHost` / `targetPort` | **远端**房间服务器的地址和端口 |
 
 Docker 里这些 UDP 端口是**在容器内监听**的，所以必须用 `-p` 发布出来才能被玩家连到。发布多少个就对应多少个房间。
 
@@ -510,7 +525,7 @@ mhg-gateway-admin [选项]
   配置文件: /srv/mhg-gateway-admin/config.json
   监听: 0.0.0.0:8720
   管理员: 已初始化
-  房间: 6
+  端口映射: 6 条
   网关程序: /srv/mhg-gateway-admin/bin/citra-gateway
   运行目录: /srv/mhg-gateway-admin/data/rooms
 ```
@@ -545,15 +560,14 @@ sudo journalctl -u mhg-gateway-admin -f
 | POST | `/api/login` | 公开 | 登录，返回 `csrfToken` |
 | POST | `/api/logout` | 公开 | 退出并清 cookie |
 | POST | `/api/password` | 已登录 | 改自己的密码，**吊销所有会话** |
-| GET | `/api/dashboard` | viewer | 统计 + 房间 + 服务器 + 事件 + 网关程序状态 |
-| GET/POST | `/api/servers` | viewer / admin | 列表 / 新增 |
-| PATCH/DELETE | `/api/servers/:id` | admin | 改 / 删（被房间引用时拒删） |
-| GET/POST | `/api/rooms` | viewer / admin | 列表 / 新增（端口留空自动分配） |
-| PATCH/DELETE | `/api/rooms/:id` | admin | 改 / 删（运行中不能改需要重启的字段） |
-| POST | `/api/rooms/:id/start` | admin | 启动；失败返回 409 + 原因 |
-| POST | `/api/rooms/:id/stop` | admin | 停止（SIGTERM，5 秒后 SIGKILL） |
-| POST | `/api/rooms/batch/:action` | admin | `start` / `stop` 批量，**逐房返回成功与否** |
-| GET | `/api/rooms/:id/log` | viewer | 日志尾部（`?lines=200`） |
+| GET | `/api/dashboard` | viewer | 统计 + 映射 + 事件 + 端口池 + 网关程序状态 |
+| GET | `/api/mappings` | viewer | 映射列表 |
+| POST | `/api/mappings` | admin | 新增映射（`localPort` 可留空自动分配） |
+| PATCH/DELETE | `/api/mappings/:id` | admin | 改 / 删（运行中不能改需要重启的字段） |
+| POST | `/api/mappings/:id/start` | admin | 启动；失败返回 409 + 原因 |
+| POST | `/api/mappings/:id/stop` | admin | 停止（SIGTERM，5 秒后 SIGKILL） |
+| POST | `/api/mappings/batch/:action` | admin | `start` / `stop` 批量，**逐条返回成功与否** |
+| GET | `/api/mappings/:id/log` | viewer | 日志尾部（`?lines=200`） |
 | GET/POST | `/api/users` | admin | 账户列表 / 新增 |
 | DELETE | `/api/users/:id` | admin | 删除（拥有者与自身不可删） |
 | GET | `/api/events` | viewer | 审计事件（`?roomId=&limit=`） |
@@ -568,9 +582,14 @@ resp=$(curl -s -c jar.txt -H 'Content-Type: application/json' \
      http://127.0.0.1:8720/api/login)
 csrf=$(echo "$resp" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["csrfToken"])')
 
-# 批量启动房间 1 和 2
+# 一条映射：本地 25000 -> www.okuapi.xyz:9901
 curl -s -b jar.txt -H "x-csrf-token: $csrf" -H 'Content-Type: application/json' \
-     -d '{"ids":[1,2]}' http://127.0.0.1:8720/api/rooms/batch/start
+     -d '{"name":"oku-1","localPort":25000,"targetHost":"www.okuapi.xyz","targetPort":9901}' \
+     http://127.0.0.1:8720/api/mappings
+
+# 批量启动映射 1 和 2
+curl -s -b jar.txt -H "x-csrf-token: $csrf" -H 'Content-Type: application/json' \
+     -d '{"ids":[1,2]}' http://127.0.0.1:8720/api/mappings/batch/start
 ```
 
 ---
@@ -588,8 +607,8 @@ curl -s -b jar.txt -H "x-csrf-token: $csrf" -H 'Content-Type: application/json' 
 - 改密码会**吊销该账户全部会话**
 - 统一安全响应头：严格 **CSP**（禁内联脚本/样式、禁外部源）、`X-Frame-Options: DENY`、`nosniff`、`Referrer-Policy: no-referrer`
 - 静态文件路径做了**穿越防护**（不能读 `public/` 以外的东西），扩展名白名单
-- 房间/服务器密码**永不回显给浏览器**，**也永不写进日志**（启动命令行里的密码被替换成 `***`）
-- 子进程用数组参数 + `shell: false` 启动，房间名不可能变成命令
+- 映射的房间密码**永不回显给浏览器**，**也永不写进日志**（启动命令行里的密码被替换成 `***`）
+- 子进程用数组参数 + `shell: false` 启动，映射名不可能变成命令
 - 容器内以非 root 的 `node` 用户运行
 
 明确的边界：
@@ -646,12 +665,12 @@ docker run --rm -v mhg-admin-data:/data -v "$PWD":/backup alpine \
 - Docker：确认挂载了 `/app/bin/citra-gateway` 且可执行
 
 **房间显示「异常」并快速失败**
-- 看该房间日志（房间列表 → 日志）。常见原因：房间服务器地址/端口不对、密码错、端口被别的程序占用
-- 反复退出 5 次后会自动熔断并停止重试，避免刷屏；原因写在房间的失败信息里
+- 看该映射日志（映射列表 → 日志）。常见原因：目标服务器地址/端口不对、密码错、本地端口被别的程序占用
+- 反复退出 5 次后会自动熔断并停止重试，避免刷屏；原因写在映射的失败信息里
 
 **端口冲突**
-- 新建房间时明确报 `port_in_use`：换端口或改端口池
-- 报 `port_pool_exhausted`：端口池用完，扩大 `citraPortRange` / `roomPortRange`
+- 新建映射时明确报 `port_in_use`：换本地端口，或让系统自动分配
+- 报 `port_pool_exhausted`：本地端口池用完，扩大 `localPortRange`
 
 **MySQL 切不过去**
 - `npm install mysql2`
@@ -691,15 +710,15 @@ node deploy/verify-container.js # 容器输入验证，不需要 Docker（47 项
 - **config**：默认值完整性、文件/环境变量优先级、路径解析、BOM、错误定位、深合并
 - **security**：scrypt 哈希与校验、盐随机、参数从哈希串读取、畸形哈希不抛异常、Unicode 归一化、密码策略、随机 token、`timingSafeEqual`、cookie 解析与序列化（含原型污染）
 - **datasource**：SQLite（磁盘/内存/重开/未来版本拒绝）与 MySQL（可选依赖缺失的可操作报错；装了 mysql2 时跑同一套契约）
-- **API**：初始化、登录/锁定、CSRF、登出、服务器与房间 CRUD、端口池分配与冲突、运行中改配置的拒绝、批量操作逐房结果、只读角色全路径拒绝、账户与拥有者保护、改密码吊销会话、请求体限制、静态资源与安全头、路径穿越、405/404 语义、密码不回显
-- **supervisor**：参数拼装、端口分配、二进制查找、缺少程序时的拒绝、启动/停止真实进程、崩溃重启与退避、**崩溃熔断**、日志读取与轮转、日志保留、重启后不静默重启遗留房间、停用会取消待执行的重启
+- **API**：初始化、登录/锁定、CSRF、登出、映射 CRUD、指定端口与自动分配、端口冲突与池耗尽、运行中改配置的拒绝、批量操作逐条结果、只读角色全路径拒绝、账户与拥有者保护、改密码吊销会话、请求体限制、静态资源与安全头、路径穿越、405/404 语义、密码不回显
+- **supervisor**：**参数拼装（本地端口进 --listen-port、目标端口进 --room-port）**、端口分配、二进制查找、缺少程序时的拒绝、启动/停止真实进程、崩溃重启与退避、**崩溃熔断**、日志读取与轮转、日志保留、重启后不静默重启遗留映射、停用会取消待执行的重启
 - **端到端故事**：首次使用全流程、真实进程批量启停、只读审计、**重启后数据仍在**、前端与后端接口一致性
 - **容器输入**：每个 COPY 源存在且未被 `.dockerignore` 排除、entrypoint 为 LF 且所用命令由镜像提供、健康检查 JS 可解析、容器配置能真正启动并写出数据库
 
 本轮开发中修掉的两个真实缺陷（都已加测试，避免回归）：
 
-1. **崩溃熔断永远不会触发**：重启计数挂在每次尝试新建的进程条目上，重启一次计数就清零，于是一个配置错误、启动即退出的房间会无限重启。计数器改为按房间保存在 supervisor 上。
-2. **停止房间不会取消待执行的重启**：退避期间的定时器在进程条目里，而条目在退出时已被删除，`stopRoom` 找不到它；操作员点了停止，房间仍会自己回来。定时器改为按房间单独存放。
+1. **崩溃熔断永远不会触发**：重启计数挂在每次尝试新建的进程条目上，重启一次计数就清零，于是一个配置错误、启动即退出的映射会无限重启。计数器改为按映射保存在 supervisor 上。
+2. **停止映射不会取消待执行的重启**：退避期间的定时器在进程条目里，而条目在退出时已被删除，`stopMapping` 找不到它；操作员点了停止，映射仍会自己回来。定时器改为按映射单独存放。
 
 `node:sqlite` 在 Node 22 上会打印一次 `ExperimentalWarning`，这不是错误。
 

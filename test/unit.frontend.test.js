@@ -37,10 +37,19 @@ async function runApp({ routes = {}, settleMs = 60 } = {}) {
     const requests = [];
     const clock = {
         intervals: new Set(),
-        setTimeout: (fn, ms) => setTimeout(fn, ms),
+        // The views start a periodic refresh. In a browser that is the point; in a
+        // test it would keep the process alive after the assertions finish, so every
+        // timer here is unref'd. The tests drive rendering explicitly and never wait
+        // on a tick.
+        setTimeout: (fn, ms) => {
+            const handle = setTimeout(fn, ms);
+            handle.unref?.();
+            return handle;
+        },
         clearTimeout: (handle) => clearTimeout(handle),
         setInterval: (fn, ms) => {
             const handle = setInterval(fn, ms);
+            handle.unref?.();
             clock.intervals.add(handle);
             return handle;
         },
@@ -164,19 +173,24 @@ test('the signed-in shell renders with every navigation entry', async () => {
                 body: {
                     data: {
                         counts: { total: 2, running: 1, stopped: 1, failed: 0 },
-                        rooms: [
-                            { id: 1, name: '大厅-A', state: 'running', pid: 123, serverName: '主服务器', citraPort: 25000 },
-                            { id: 2, name: '大厅-B', state: 'stopped', pid: null, serverName: '主服务器', citraPort: 25001 },
+                        mappings: [
+                            {
+                                id: 1, name: 'oku-1', localPort: 25000, targetHost: 'www.okuapi.xyz',
+                                targetPort: 9901, state: 'running', pid: 123, hasPassword: true, profile: 'default',
+                            },
+                            {
+                                id: 2, name: 'oku-2', localPort: 25001, targetHost: 'www.okuapi.xyz',
+                                targetPort: 9902, state: 'stopped', pid: null, hasPassword: false, profile: 'default',
+                            },
                         ],
-                        servers: [{ id: 1, name: '主服务器', host: '127.0.0.1', port: 24872 }],
-                        events: [{ id: 1, kind: 'room.started', detail: 'pid=123', actor: 'admin', createdAt: Date.now() }],
+                        events: [{ id: 1, kind: 'mapping.started', detail: 'pid=123', actor: 'admin', at: Date.now() }],
+                        localPortRange: [25000, 25999],
                         gatewayBinaryFound: true,
                     },
                 },
             },
             'GET /api/events': { body: { data: [] } },
-            'GET /api/rooms': { body: { data: [] } },
-            'GET /api/servers': { body: { data: [] } },
+            'GET /api/mappings': { body: { data: [] } },
             'GET /api/users': { body: { data: [] } },
             'GET /api/diagnostics': { body: { data: null } },
         },
@@ -184,9 +198,11 @@ test('the signed-in shell renders with every navigation entry', async () => {
     const text = app.app.textContent;
     // The shell must at minimum show the account and the navigation surface.
     assert.match(text, /admin/, `登录后应显示当前账户，实际渲染: ${text.slice(0, 300)}`);
-    for (const label of ['总览', '房间', '服务器']) {
+    for (const label of ['总览', '端口映射', '事件记录']) {
         assert.ok(text.includes(label), `导航应包含「${label}」，实际渲染: ${text.slice(0, 400)}`);
     }
+    // The old two-entity navigation is gone.
+    assert.equal(text.includes('房间服务器'), false, '导航不应再有「房间服务器」');
     assert.ok(app.app.querySelectorAll('button').length >= 3, 'shell 应渲染出操作按钮');
 });
 
@@ -200,16 +216,15 @@ test('every view function can be called without throwing', async () => {
     const app = await runApp({
         routes: {
             'GET /api/session': { body: { data: session } },
-            'GET /api/dashboard': { body: { data: { counts: { total: 0, running: 0, stopped: 0, failed: 0 }, rooms: [], servers: [], events: [], gatewayBinaryFound: false } } },
-            'GET /api/rooms': { body: { data: [] } },
-            'GET /api/servers': { body: { data: [] } },
+            'GET /api/dashboard': { body: { data: { counts: { total: 0, running: 0, stopped: 0, failed: 0 }, mappings: [], events: [], localPortRange: [25000, 25999], gatewayBinaryFound: false } } },
+            'GET /api/mappings': { body: { data: [] } },
             'GET /api/users': { body: { data: [] } },
             'GET /api/events': { body: { data: [] } },
-            'GET /api/diagnostics': { body: { data: { datasource: 'sqlite', citraPortRange: [25000, 25999], roomPortRange: [24000, 24999], usedCitraPorts: [], usedRoomPorts: [], nodeVersion: 'v22.20.0' } } },
+            'GET /api/diagnostics': { body: { data: { datasource: 'sqlite', localPortRange: [25000, 25999], usedLocalPorts: [], nodeVersion: 'v22.20.0' } } },
         },
     });
 
-    const views = ['viewDashboard', 'viewRooms', 'viewServers', 'viewEvents', 'viewUsers', 'viewSettings'];
+    const views = ['viewDashboard', 'viewMappings', 'viewEvents', 'viewUsers', 'viewSettings'];
     for (const name of views) {
         assert.equal(typeof app.sandbox[name], 'function', `${name} 应存在`);
     }
@@ -232,21 +247,36 @@ test('non-owner accounts do not get destructive controls', async () => {
     const app = await runApp({
         routes: {
             'GET /api/session': { body: { data: session } },
-            'GET /api/servers': {
-                body: { data: [{ id: 1, name: '服务器', host: '127.0.0.1', port: 24872, hasPassword: false, notes: '' }] },
+            'GET /api/mappings': {
+                body: {
+                    data: [{
+                        id: 1, name: 'oku-1', localPort: 25000, targetHost: 'www.okuapi.xyz',
+                        targetPort: 9901, state: 'stopped', pid: null, hasPassword: false, profile: 'default',
+                    }],
+                },
             },
-            'GET /api/rooms': { body: { data: [] } },
             'GET /api/events': { body: { data: [] } },
-            'GET /api/dashboard': { body: { data: { counts: { total: 0, running: 0, stopped: 0, failed: 0 }, rooms: [], servers: [], events: [], gatewayBinaryFound: false } } },
+            'GET /api/dashboard': { body: { data: { counts: { total: 0, running: 0, stopped: 0, failed: 0 }, mappings: [], events: [], localPortRange: [25000, 25999], gatewayBinaryFound: false } } },
         },
     });
     const target = app.document.createElement('div');
-    await app.sandbox.viewServers(target);
+    await app.sandbox.viewMappings(target);
     const text = target.textContent;
-    assert.match(text, /服务器/, 'viewer 仍能看到服务器列表');
-    assert.equal(text.includes('删除'), false, 'viewer 不应看到删除按钮');
-    assert.equal(text.includes('编辑'), false, 'viewer 不应看到编辑按钮');
-    assert.equal(text.includes('添加服务器'), false, 'viewer 不应看到添加按钮');
+    assert.match(text, /oku-1/, 'viewer 仍能看到映射列表');
+    assert.match(text, /25000/, 'viewer 能看到本地端口');
+
+    // Destructive controls are buttons, so assert on the button surface rather than
+    // the whole text: the page's own hint text mentions "批量启动" too.
+    const buttonLabels = [...target.querySelectorAll('button')].map((node) => node.textContent.trim());
+    for (const forbidden of ['新建映射', '批量启动', '批量停止', '删除', '编辑']) {
+        assert.equal(
+            buttonLabels.some((label) => label === forbidden || label.includes(forbidden)),
+            false,
+            `viewer 不应看到「${forbidden}」按钮，实际按钮: ${JSON.stringify(buttonLabels)}`,
+        );
+    }
+    // Reading a log is not destructive, so it stays available.
+    assert.ok(buttonLabels.some((label) => label.includes('日志')), 'viewer 仍可查看日志');
 });
 
 test('index.html and app.js agree on what the shell provides', () => {

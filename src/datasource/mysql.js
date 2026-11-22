@@ -9,7 +9,7 @@
 // installs or builds it. Requiring the driver without the package produces a
 // message that names the exact install command.
 
-import { Datasource, SCHEMA_VERSION } from './index.js';
+import { Datasource, SCHEMA_VERSION, MAPPING_COLUMNS, MAPPING_ALIASES } from './index.js';
 
 function nowMs() {
     return Date.now();
@@ -142,28 +142,18 @@ export class MysqlDatasource extends Datasource {
                     REFERENCES ${this.table('users')} (id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
+        // Mappings: one row is one pair (local port -> one upstream room server).
+        // local_port is UNIQUE so two rows cannot claim the same player-facing port.
         await this.#exec(`
-            CREATE TABLE IF NOT EXISTS ${this.table('servers')} (
+            CREATE TABLE IF NOT EXISTS ${this.table('mappings')} (
                 id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
                 name VARCHAR(64) NOT NULL,
-                host VARCHAR(255) NOT NULL,
-                port INT NOT NULL,
+                local_port INT NOT NULL,
+                target_host VARCHAR(255) NOT NULL,
+                target_port INT NOT NULL,
                 password VARCHAR(255) NOT NULL DEFAULT '',
-                notes VARCHAR(1024) NOT NULL DEFAULT '',
-                created_at BIGINT NOT NULL,
-                updated_at BIGINT NOT NULL,
-                UNIQUE KEY uniq_servers_name (name)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        `);
-        await this.#exec(`
-            CREATE TABLE IF NOT EXISTS ${this.table('rooms')} (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(64) NOT NULL,
-                server_id BIGINT NULL,
-                citra_port INT NOT NULL,
-                room_port INT NOT NULL,
                 listen_address VARCHAR(64) NOT NULL DEFAULT '0.0.0.0',
-                password VARCHAR(255) NOT NULL DEFAULT '',
+                capacity INT NOT NULL DEFAULT 4,
                 profile VARCHAR(32) NOT NULL DEFAULT 'default',
                 desired_state VARCHAR(16) NOT NULL DEFAULT 'stopped',
                 state VARCHAR(16) NOT NULL DEFAULT 'stopped',
@@ -172,24 +162,23 @@ export class MysqlDatasource extends Datasource {
                 started_at BIGINT NULL,
                 stopped_at BIGINT NULL,
                 extra_args TEXT NOT NULL,
+                notes VARCHAR(1024) NOT NULL DEFAULT '',
                 created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL,
-                UNIQUE KEY uniq_rooms_name (name),
-                KEY idx_rooms_server (server_id),
-                CONSTRAINT fk_rooms_server FOREIGN KEY (server_id)
-                    REFERENCES ${this.table('servers')} (id) ON DELETE SET NULL
+                UNIQUE KEY uniq_mappings_name (name),
+                UNIQUE KEY uniq_mappings_local_port (local_port)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
         await this.#exec(`
             CREATE TABLE IF NOT EXISTS ${this.table('events')} (
                 id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                room_id BIGINT NULL,
+                mapping_id BIGINT NULL,
                 at BIGINT NOT NULL,
                 kind VARCHAR(64) NOT NULL,
                 detail VARCHAR(1024) NOT NULL DEFAULT '',
                 actor VARCHAR(64) NOT NULL DEFAULT '',
                 KEY idx_events_at (at),
-                KEY idx_events_room (room_id, at)
+                KEY idx_events_mapping (mapping_id, at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `);
         await this.#exec(`
@@ -202,16 +191,94 @@ export class MysqlDatasource extends Datasource {
         const current = await this.#get(
             `SELECT \`value\` AS v FROM ${this.table('schema_meta')} WHERE \`key\` = 'schema_version'`,
         );
-        if (!current) {
-            await this.#exec(
-                `INSERT INTO ${this.table('schema_meta')} (\`key\`, \`value\`) VALUES ('schema_version', ?)`,
-                [String(SCHEMA_VERSION)],
-            );
-        } else if (Number(current.v) !== SCHEMA_VERSION) {
+        const version = current ? Number(current.v) : null;
+        if (version !== null && version > SCHEMA_VERSION) {
+            // Running on a newer schema could silently drop or corrupt rows.
             throw new Error(
-                `database schema version ${current.v} is not supported by this build (expected ${SCHEMA_VERSION})`,
+                `database schema version ${version} is newer than this build supports (${SCHEMA_VERSION})`,
             );
         }
+        if (version === 1 && (await this.#tableExists('rooms'))) {
+            await this.#migrateV1ToV2();
+        }
+        await this.#exec(
+            `INSERT INTO ${this.table('schema_meta')} (\`key\`, \`value\`) VALUES ('schema_version', ?)
+             ON DUPLICATE KEY UPDATE \`value\` = VALUES(\`value\`)`,
+            [String(SCHEMA_VERSION)],
+        );
+    }
+
+    /** MySQL has no sqlite_master; information_schema is the portable check. */
+    async #tableExists(name) {
+        const row = await this.#get(
+            `SELECT COUNT(*) AS n FROM information_schema.tables
+             WHERE table_schema = DATABASE() AND table_name = ?`,
+            [this.prefix + name],
+        );
+        return Number(row?.n ?? 0) > 0;
+    }
+
+    /**
+     * Version 1 stored one mapping across `servers` + `rooms`, and kept the upstream
+     * port in a local pool column. Version 2 makes the pair one row, and the upstream
+     * port has to come from the server side because that is what the gateway dials.
+     * Ids are preserved so event history keeps pointing at the right mapping.
+     */
+    async #migrateV1ToV2() {
+        const hasServers = await this.#tableExists('servers');
+        if (hasServers) {
+            await this.#exec(`
+                INSERT IGNORE INTO ${this.table('mappings')}
+                    (id, name, local_port, target_host, target_port, password, listen_address,
+                     profile, desired_state, state, extra_args, notes, created_at, updated_at)
+                SELECT r.id, r.name, r.citra_port,
+                       COALESCE(NULLIF(s.host, ''), '127.0.0.1'),
+                       COALESCE(s.port, r.room_port),
+                       COALESCE(NULLIF(s.password, ''), r.password, ''),
+                       COALESCE(NULLIF(r.listen_address, ''), '0.0.0.0'),
+                       COALESCE(NULLIF(r.profile, ''), 'default'),
+                       'stopped', 'stopped',
+                       COALESCE(NULLIF(r.extra_args, ''), '[]'),
+                       '', r.created_at, r.updated_at
+                FROM ${this.table('rooms')} r
+                LEFT JOIN ${this.table('servers')} s ON s.id = r.server_id
+            `);
+        } else {
+            await this.#exec(`
+                INSERT IGNORE INTO ${this.table('mappings')}
+                    (id, name, local_port, target_host, target_port, password, listen_address,
+                     profile, desired_state, state, extra_args, notes, created_at, updated_at)
+                SELECT r.id, r.name, r.citra_port, '127.0.0.1', r.room_port,
+                       COALESCE(r.password, ''), COALESCE(NULLIF(r.listen_address, ''), '0.0.0.0'),
+                       COALESCE(NULLIF(r.profile, ''), 'default'), 'stopped', 'stopped',
+                       COALESCE(NULLIF(r.extra_args, ''), '[]'), '', r.created_at, r.updated_at
+                FROM ${this.table('rooms')} r
+            `);
+        }
+        if (await this.#tableExists('events')) {
+            await this.#exec(`RENAME TABLE ${this.table('events')} TO ${this.table('events_v1')}`);
+            await this.#exec(`
+                CREATE TABLE ${this.table('events')} (
+                    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    mapping_id BIGINT NULL,
+                    at BIGINT NOT NULL,
+                    kind VARCHAR(64) NOT NULL,
+                    detail VARCHAR(1024) NOT NULL DEFAULT '',
+                    actor VARCHAR(64) NOT NULL DEFAULT '',
+                    KEY idx_events_at (at),
+                    KEY idx_events_mapping (mapping_id, at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+            await this.#exec(`
+                INSERT INTO ${this.table('events')} (id, mapping_id, at, kind, detail, actor)
+                SELECT e.id, e.room_id, e.at, e.kind, e.detail, e.actor
+                FROM ${this.table('events_v1')} e
+                WHERE e.room_id IS NULL OR e.room_id IN (SELECT id FROM ${this.table('mappings')})
+            `);
+            await this.#exec(`DROP TABLE ${this.table('events_v1')}`);
+        }
+        await this.#exec(`DROP TABLE IF EXISTS ${this.table('rooms')}`);
+        await this.#exec(`DROP TABLE IF EXISTS ${this.table('servers')}`);
     }
 
     // ---- settings ---------------------------------------------------------
@@ -329,76 +396,38 @@ export class MysqlDatasource extends Datasource {
         return Number(result.affectedRows ?? 0);
     }
 
-    // ---- servers ----------------------------------------------------------
-    async listServers() {
-        return this.#all(`SELECT * FROM ${this.table('servers')} ORDER BY name`);
+    // ---- mappings ---------------------------------------------------------
+    async listMappings() {
+        return this.#all(`SELECT * FROM ${this.table('mappings')} ORDER BY local_port, id`);
     }
 
-    async findServerById(id) {
-        return this.#get(`SELECT * FROM ${this.table('servers')} WHERE id = ?`, [id]);
+    async findMappingById(id) {
+        return this.#get(`SELECT * FROM ${this.table('mappings')} WHERE id = ?`, [id]);
     }
 
-    async createServer({ name, host, port, password = '', notes = '' }) {
+    async findMappingByName(name) {
+        return this.#get(`SELECT * FROM ${this.table('mappings')} WHERE name = ?`, [name]);
+    }
+
+    async createMapping(mapping) {
         const at = nowMs();
         const result = await this.#exec(
-            `INSERT INTO ${this.table('servers')} (name, host, port, password, notes, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [name, host, port, password, notes, at, at],
-        );
-        return Number(result.insertId);
-    }
-
-    async updateServer(id, fields) {
-        const allowed = ['name', 'host', 'port', 'password', 'notes'];
-        const sets = [];
-        const params = [];
-        for (const key of allowed) {
-            if (fields[key] !== undefined) {
-                sets.push(`${ident(key)} = ?`);
-                params.push(fields[key]);
-            }
-        }
-        if (sets.length === 0) return;
-        sets.push('updated_at = ?');
-        params.push(nowMs(), id);
-        await this.#exec(`UPDATE ${this.table('servers')} SET ${sets.join(', ')} WHERE id = ?`, params);
-    }
-
-    async deleteServer(id) {
-        await this.#exec(`DELETE FROM ${this.table('servers')} WHERE id = ?`, [id]);
-    }
-
-    // ---- rooms ------------------------------------------------------------
-    async listRooms() {
-        return this.#all(`SELECT * FROM ${this.table('rooms')} ORDER BY name`);
-    }
-
-    async findRoomById(id) {
-        return this.#get(`SELECT * FROM ${this.table('rooms')} WHERE id = ?`, [id]);
-    }
-
-    async findRoomByName(name) {
-        return this.#get(`SELECT * FROM ${this.table('rooms')} WHERE name = ?`, [name]);
-    }
-
-    async createRoom(room) {
-        const at = nowMs();
-        const result = await this.#exec(
-            `INSERT INTO ${this.table('rooms')} (name, server_id, citra_port, room_port,
-                    listen_address, password, profile, desired_state, state, extra_args,
-                    created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO ${this.table('mappings')} (name, local_port, target_host, target_port,
+                    password, listen_address, capacity, profile, desired_state, state,
+                    extra_args, notes, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?)`,
             [
-                room.name,
-                room.serverId ?? null,
-                room.citraPort,
-                room.roomPort,
-                room.listenAddress ?? '0.0.0.0',
-                room.password ?? '',
-                room.profile ?? 'default',
-                room.desiredState ?? 'stopped',
-                'stopped',
-                JSON.stringify(room.extraArgs ?? []),
+                mapping.name,
+                mapping.localPort,
+                mapping.targetHost,
+                mapping.targetPort,
+                mapping.password ?? '',
+                mapping.listenAddress ?? '0.0.0.0',
+                mapping.capacity ?? 4,
+                mapping.profile ?? 'default',
+                mapping.desiredState ?? 'stopped',
+                JSON.stringify(mapping.extraArgs ?? []),
+                mapping.notes ?? '',
                 at,
                 at,
             ],
@@ -406,58 +435,54 @@ export class MysqlDatasource extends Datasource {
         return Number(result.insertId);
     }
 
-    async updateRoom(id, fields) {
-        const allowed = [
-            'name', 'server_id', 'citra_port', 'room_port', 'listen_address', 'password',
-            'profile', 'desired_state', 'state', 'pid', 'failure', 'started_at', 'stopped_at',
-            'extra_args',
-        ];
-        // Same camelCase -> column alias mapping as the SQLite driver.
-        const aliases = { extraArgs: 'extra_args', citraPort: 'citra_port', roomPort: 'room_port' };
+    async updateMapping(id, fields) {
         const sets = [];
         const params = [];
         for (const [rawKey, value] of Object.entries(fields)) {
-            const key = aliases[rawKey] ?? rawKey;
-            if (!allowed.includes(key) || value === undefined) continue;
+            const key = MAPPING_ALIASES[rawKey] ?? rawKey;
+            if (!MAPPING_COLUMNS.includes(key) || value === undefined) continue;
             sets.push(`${ident(key)} = ?`);
-            params.push(key === 'extra_args' ? JSON.stringify(value) : value);
+            params.push(key === 'extra_args' ? JSON.stringify(value ?? []) : value);
         }
-        if (sets.length === 0) return;
+        if (sets.length === 0) return 0;
         sets.push('updated_at = ?');
         params.push(nowMs(), id);
-        await this.#exec(`UPDATE ${this.table('rooms')} SET ${sets.join(', ')} WHERE id = ?`, params);
+        const result = await this.#exec(
+            `UPDATE ${this.table('mappings')} SET ${sets.join(', ')} WHERE id = ?`,
+            params,
+        );
+        return Number(result.affectedRows ?? 0);
     }
 
-    async deleteRoom(id) {
-        await this.#exec(`DELETE FROM ${this.table('rooms')} WHERE id = ?`, [id]);
+    async deleteMapping(id) {
+        const result = await this.#exec(`DELETE FROM ${this.table('mappings')} WHERE id = ?`, [id]);
+        return Number(result.affectedRows ?? 0);
     }
 
-    async listUsedPorts() {
-        const rows = await this.#all(`SELECT citra_port, room_port FROM ${this.table('rooms')}`);
-        return {
-            citra: new Set(rows.map((row) => Number(row.citra_port))),
-            room: new Set(rows.map((row) => Number(row.room_port))),
-        };
+    async listUsedLocalPorts() {
+        const rows = await this.#all(`SELECT local_port FROM ${this.table('mappings')}`);
+        return rows.map((row) => Number(row.local_port));
     }
 
     // ---- events -----------------------------------------------------------
-    async addEvent({ roomId = null, at = nowMs(), kind, detail = '', actor = '' }) {
+    async addEvent({ mappingId = null, at = nowMs(), kind, detail = '', actor = '' }) {
         await this.#exec(
-            `INSERT INTO ${this.table('events')} (room_id, at, kind, detail, actor) VALUES (?, ?, ?, ?, ?)`,
-            [roomId, at, kind, detail, actor],
+            `INSERT INTO ${this.table('events')} (mapping_id, at, kind, detail, actor)
+             VALUES (?, ?, ?, ?, ?)`,
+            [mappingId, at, kind, detail, actor],
         );
     }
 
-    async listEvents({ roomId = null, limit = 100 } = {}) {
-        if (roomId === null) {
+    async listEvents({ mappingId = null, limit = 100 } = {}) {
+        if (mappingId === null) {
             return this.#all(
                 `SELECT * FROM ${this.table('events')} ORDER BY at DESC, id DESC LIMIT ?`,
                 [limit],
             );
         }
         return this.#all(
-            `SELECT * FROM ${this.table('events')} WHERE room_id = ? ORDER BY at DESC, id DESC LIMIT ?`,
-            [roomId, limit],
+            `SELECT * FROM ${this.table('events')} WHERE mapping_id = ? ORDER BY at DESC, id DESC LIMIT ?`,
+            [mappingId, limit],
         );
     }
 

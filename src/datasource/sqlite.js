@@ -12,7 +12,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { Datasource, SCHEMA_VERSION } from './index.js';
+import { Datasource, SCHEMA_VERSION, MAPPING_COLUMNS, MAPPING_ALIASES } from './index.js';
 
 const SQLITE_TIMEOUT_MS = 5000;
 
@@ -83,7 +83,12 @@ export class SqliteDatasource extends Datasource {
         return this.db.prepare(sql).all(...params);
     }
 
+    #tableExists(name) {
+        return Boolean(this.#get(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, [name]));
+    }
+
     #migrate() {
+        // Base tables that are identical across versions.
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS schema_meta (
                 key TEXT PRIMARY KEY,
@@ -114,64 +119,156 @@ export class SqliteDatasource extends Datasource {
             );
             CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
             CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
-            CREATE TABLE IF NOT EXISTS servers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                host TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                password TEXT NOT NULL DEFAULT '',
-                notes TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS rooms (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                server_id INTEGER REFERENCES servers(id) ON DELETE SET NULL,
-                citra_port INTEGER NOT NULL,
-                room_port INTEGER NOT NULL,
-                listen_address TEXT NOT NULL DEFAULT '0.0.0.0',
-                password TEXT NOT NULL DEFAULT '',
-                profile TEXT NOT NULL DEFAULT 'default',
-                desired_state TEXT NOT NULL DEFAULT 'stopped',
-                state TEXT NOT NULL DEFAULT 'stopped',
-                pid INTEGER,
-                failure TEXT NOT NULL DEFAULT '',
-                started_at INTEGER,
-                stopped_at INTEGER,
-                extra_args TEXT NOT NULL DEFAULT '[]',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                room_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE,
-                at INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                detail TEXT NOT NULL DEFAULT '',
-                actor TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS events_at ON events(at);
-            CREATE INDEX IF NOT EXISTS events_room ON events(room_id, at);
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
         `);
+
         const current = this.#get(`SELECT value FROM schema_meta WHERE key = 'schema_version'`);
-        if (!current) {
-            this.#exec(`INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)`, [
-                String(SCHEMA_VERSION),
-            ]);
-        } else if (Number(current.value) !== SCHEMA_VERSION) {
-            // Only v1 exists so far; a future migration adds its step here and
-            // updates schema_meta. Failing loudly beats running on an unknown
-            // schema and silently losing rows.
+        const version = current ? Number(current.value) : null;
+
+        if (version !== null && version > SCHEMA_VERSION) {
+            // Running on an unknown newer schema could silently drop or corrupt rows.
             throw new Error(
-                `database schema version ${current.value} is not supported by this build (expected ${SCHEMA_VERSION})`,
+                `database schema version ${version} is newer than this build supports (${SCHEMA_VERSION})`,
             );
         }
+
+        if (version === 1) this.#migrateV1ToV2();
+
+        this.#createV2Tables();
+        this.#exec(
+            `INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            [String(SCHEMA_VERSION)],
+        );
+    }
+
+    /**
+     * Version 1 split one mapping across two tables: `servers` (the upstream room
+     * server) and `rooms` (the local listener), and it stored the upstream port in a
+     * local pool column. Version 2 makes the pair one row, so a migration here has to
+     * pick the upstream port from the server side -- that is the value the gateway
+     * actually needs.
+     *
+     * Ids are preserved so historical event rows keep pointing at the right mapping.
+     */
+    #migrateV1ToV2() {
+        const hasRooms = this.#tableExists('rooms');
+        const hasServers = this.#tableExists('servers');
+        if (!hasRooms) return;
+
+        this.#createV2Tables();
+
+        if (hasServers) {
+            this.#exec(`
+                INSERT OR IGNORE INTO mappings
+                    (id, name, local_port, target_host, target_port, password, listen_address,
+                     profile, desired_state, state, pid, failure, started_at, stopped_at,
+                     extra_args, notes, created_at, updated_at)
+                SELECT r.id,
+                       r.name,
+                       r.citra_port,
+                       COALESCE(NULLIF(s.host, ''), '127.0.0.1'),
+                       COALESCE(s.port, r.room_port),
+                       COALESCE(NULLIF(s.password, ''), r.password, ''),
+                       COALESCE(NULLIF(r.listen_address, ''), '0.0.0.0'),
+                       COALESCE(NULLIF(r.profile, ''), 'default'),
+                       COALESCE(NULLIF(r.desired_state, ''), 'stopped'),
+                       'stopped',
+                       NULL,
+                       '',
+                       r.started_at,
+                       r.stopped_at,
+                       COALESCE(NULLIF(r.extra_args, ''), '[]'),
+                       '',
+                       r.created_at,
+                       r.updated_at
+                FROM rooms r
+                LEFT JOIN servers s ON s.id = r.server_id
+            `);
+        } else {
+            this.#exec(`
+                INSERT OR IGNORE INTO mappings
+                    (id, name, local_port, target_host, target_port, password, listen_address,
+                     profile, desired_state, state, extra_args, created_at, updated_at)
+                SELECT r.id, r.name, r.citra_port, '127.0.0.1', r.room_port,
+                       COALESCE(r.password, ''), COALESCE(NULLIF(r.listen_address, ''), '0.0.0.0'),
+                       COALESCE(NULLIF(r.profile, ''), 'default'), 'stopped', 'stopped',
+                       COALESCE(NULLIF(r.extra_args, ''), '[]'), r.created_at, r.updated_at
+                FROM rooms r
+            `);
+        }
+
+        // Events move from room_id to mapping_id. The ids line up with the mappings
+        // just migrated, so history stays attached.
+        if (this.#tableExists('events')) {
+            // SQLite carries indexes along with a renamed table, so the old names
+            // would collide when the new events table re-creates them.
+            this.db.exec(`DROP INDEX IF EXISTS events_at; DROP INDEX IF EXISTS events_room;`);
+            this.db.exec(`ALTER TABLE events RENAME TO events_v1`);
+            this.#createEventsTable();
+            this.#exec(`
+                INSERT INTO events (id, mapping_id, at, kind, detail, actor)
+                SELECT e.id, e.room_id, e.at, e.kind, e.detail, e.actor
+                FROM events_v1 e
+                WHERE e.room_id IS NULL OR e.room_id IN (SELECT id FROM mappings)
+            `);
+            this.db.exec(`DROP TABLE events_v1`);
+        }
+
+        // The old pair is now represented by `mappings` only.
+        this.db.exec(`DROP TABLE IF EXISTS rooms`);
+        this.db.exec(`DROP TABLE IF EXISTS servers`);
+    }
+
+    #createV2Tables() {
+        if (!this.#tableExists('mappings')) {
+            this.db.exec(`
+                CREATE TABLE mappings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    local_port INTEGER NOT NULL UNIQUE,
+                    target_host TEXT NOT NULL,
+                    target_port INTEGER NOT NULL,
+                    password TEXT NOT NULL DEFAULT '',
+                    listen_address TEXT NOT NULL DEFAULT '0.0.0.0',
+                    capacity INTEGER NOT NULL DEFAULT 4,
+                    profile TEXT NOT NULL DEFAULT 'default',
+                    desired_state TEXT NOT NULL DEFAULT 'stopped',
+                    state TEXT NOT NULL DEFAULT 'stopped',
+                    pid INTEGER,
+                    failure TEXT NOT NULL DEFAULT '',
+                    started_at INTEGER,
+                    stopped_at INTEGER,
+                    extra_args TEXT NOT NULL DEFAULT '[]',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+            `);
+        }
+        // local_port carries a UNIQUE constraint: two mappings cannot claim the same
+        // player-facing port, which is the invariant the console's port check relies on.
+        this.#createEventsTable();
+    }
+
+    #createEventsTable() {
+        if (this.#tableExists('events')) return;
+        this.db.exec(`
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mapping_id INTEGER REFERENCES mappings(id) ON DELETE CASCADE,
+                at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                actor TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX events_at ON events(at);
+            CREATE INDEX events_mapping ON events(mapping_id, at);
+        `);
     }
 
     // ---- settings ---------------------------------------------------------
@@ -285,75 +382,38 @@ export class SqliteDatasource extends Datasource {
         return Number(info.changes ?? 0);
     }
 
-    // ---- servers ----------------------------------------------------------
-    async listServers() {
-        return this.#all(`SELECT * FROM servers ORDER BY name COLLATE NOCASE`);
+    // ---- mappings ---------------------------------------------------------
+    async listMappings() {
+        return this.#all(`SELECT * FROM mappings ORDER BY local_port, id`);
     }
 
-    async findServerById(id) {
-        return this.#get(`SELECT * FROM servers WHERE id = ?`, [id]);
+    async findMappingById(id) {
+        return this.#get(`SELECT * FROM mappings WHERE id = ?`, [id]);
     }
 
-    async createServer({ name, host, port, password = '', notes = '' }) {
+    async findMappingByName(name) {
+        return this.#get(`SELECT * FROM mappings WHERE name = ?`, [name]);
+    }
+
+    async createMapping(mapping) {
         const at = nowMs();
         const info = this.#exec(
-            `INSERT INTO servers (name, host, port, password, notes, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [name, host, port, password, notes, at, at],
-        );
-        return Number(info.lastInsertRowid);
-    }
-
-    async updateServer(id, fields) {
-        const allowed = ['name', 'host', 'port', 'password', 'notes'];
-        const sets = [];
-        const params = [];
-        for (const key of allowed) {
-            if (fields[key] !== undefined) {
-                sets.push(`${key} = ?`);
-                params.push(fields[key]);
-            }
-        }
-        if (sets.length === 0) return;
-        sets.push('updated_at = ?');
-        params.push(nowMs(), id);
-        this.#exec(`UPDATE servers SET ${sets.join(', ')} WHERE id = ?`, params);
-    }
-
-    async deleteServer(id) {
-        this.#exec(`DELETE FROM servers WHERE id = ?`, [id]);
-    }
-
-    // ---- rooms ------------------------------------------------------------
-    async listRooms() {
-        return this.#all(`SELECT * FROM rooms ORDER BY name COLLATE NOCASE`);
-    }
-
-    async findRoomById(id) {
-        return this.#get(`SELECT * FROM rooms WHERE id = ?`, [id]);
-    }
-
-    async findRoomByName(name) {
-        return this.#get(`SELECT * FROM rooms WHERE name = ?`, [name]);
-    }
-
-    async createRoom(room) {
-        const at = nowMs();
-        const info = this.#exec(
-            `INSERT INTO rooms (name, server_id, citra_port, room_port, listen_address, password,
-                                profile, desired_state, state, extra_args, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO mappings (name, local_port, target_host, target_port, password,
+                                   listen_address, capacity, profile, desired_state, state,
+                                   extra_args, notes, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?)`,
             [
-                room.name,
-                room.serverId ?? null,
-                room.citraPort,
-                room.roomPort,
-                room.listenAddress ?? '0.0.0.0',
-                room.password ?? '',
-                room.profile ?? 'default',
-                room.desiredState ?? 'stopped',
-                'stopped',
-                JSON.stringify(room.extraArgs ?? []),
+                mapping.name,
+                mapping.localPort,
+                mapping.targetHost,
+                mapping.targetPort,
+                mapping.password ?? '',
+                mapping.listenAddress ?? '0.0.0.0',
+                mapping.capacity ?? 4,
+                mapping.profile ?? 'default',
+                mapping.desiredState ?? 'stopped',
+                JSON.stringify(mapping.extraArgs ?? []),
+                mapping.notes ?? '',
                 at,
                 at,
             ],
@@ -361,45 +421,35 @@ export class SqliteDatasource extends Datasource {
         return Number(info.lastInsertRowid);
     }
 
-    async updateRoom(id, fields) {
-        const allowed = [
-            'name', 'server_id', 'citra_port', 'room_port', 'listen_address', 'password',
-            'profile', 'desired_state', 'state', 'pid', 'failure', 'started_at', 'stopped_at',
-            'extra_args',
-        ];
-        // Callers use the camelCase field the room object exposes; the columns are
-        // snake_case. Mapping here keeps the route layer free of column names.
-        const aliases = { extraArgs: 'extra_args', citraPort: 'citra_port', roomPort: 'room_port' };
+    async updateMapping(id, fields) {
         const sets = [];
         const params = [];
         for (const [rawKey, value] of Object.entries(fields)) {
-            const key = aliases[rawKey] ?? rawKey;
-            if (!allowed.includes(key) || value === undefined) continue;
+            const key = MAPPING_ALIASES[rawKey] ?? rawKey;
+            if (!MAPPING_COLUMNS.includes(key) || value === undefined) continue;
             sets.push(`${key} = ?`);
-            params.push(key === 'extra_args' ? JSON.stringify(value) : value);
+            params.push(key === 'extra_args' ? JSON.stringify(value ?? []) : value);
         }
-        if (sets.length === 0) return;
+        if (sets.length === 0) return 0;
         sets.push('updated_at = ?');
         params.push(nowMs(), id);
-        this.#exec(`UPDATE rooms SET ${sets.join(', ')} WHERE id = ?`, params);
+        const info = this.#exec(`UPDATE mappings SET ${sets.join(', ')} WHERE id = ?`, params);
+        return Number(info.changes ?? 0);
     }
 
-    async deleteRoom(id) {
-        this.#exec(`DELETE FROM rooms WHERE id = ?`, [id]);
+    async deleteMapping(id) {
+        const info = this.#exec(`DELETE FROM mappings WHERE id = ?`, [id]);
+        return Number(info.changes ?? 0);
     }
 
-    async listUsedPorts() {
-        const rows = this.#all(`SELECT citra_port, room_port FROM rooms`);
-        return {
-            citra: new Set(rows.map((row) => row.citra_port)),
-            room: new Set(rows.map((row) => row.room_port)),
-        };
+    async listUsedLocalPorts() {
+        return this.#all(`SELECT local_port FROM mappings`).map((row) => row.local_port);
     }
 
     // ---- events -----------------------------------------------------------
-    async addEvent({ roomId = null, at = nowMs(), kind, detail = '', actor = '' }) {
-        this.#exec(`INSERT INTO events (room_id, at, kind, detail, actor) VALUES (?, ?, ?, ?, ?)`, [
-            roomId,
+    async addEvent({ mappingId = null, at = nowMs(), kind, detail = '', actor = '' }) {
+        this.#exec(`INSERT INTO events (mapping_id, at, kind, detail, actor) VALUES (?, ?, ?, ?, ?)`, [
+            mappingId,
             at,
             kind,
             detail,
@@ -407,13 +457,13 @@ export class SqliteDatasource extends Datasource {
         ]);
     }
 
-    async listEvents({ roomId = null, limit = 100 } = {}) {
-        if (roomId === null) {
+    async listEvents({ mappingId = null, limit = 100 } = {}) {
+        if (mappingId === null) {
             return this.#all(`SELECT * FROM events ORDER BY at DESC, id DESC LIMIT ?`, [limit]);
         }
         return this.#all(
-            `SELECT * FROM events WHERE room_id = ? ORDER BY at DESC, id DESC LIMIT ?`,
-            [roomId, limit],
+            `SELECT * FROM events WHERE mapping_id = ? ORDER BY at DESC, id DESC LIMIT ?`,
+            [mappingId, limit],
         );
     }
 

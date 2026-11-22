@@ -120,90 +120,85 @@ async function runContract(ds, { label }) {
         await ds.deleteSessionsForUser(aliceId);
         assert.equal(await ds.findSessionByTokenHash(tokenHash), undefined, `${label}: revoke-all works`);
 
-        // ---- servers ----
-        const serverId = await ds.createServer({
-            name: 'main', host: '10.0.0.1', port: 24872, password: 'pw', notes: 'note',
+        // ---- mappings ----
+        // One row is one pair: a local port and the upstream server it forwards to.
+        const mappingId = await ds.createMapping({
+            name: 'map-1',
+            localPort: 25000,
+            targetHost: 'www.example.com',
+            targetPort: 9901,
+            password: 'pw',
+            notes: 'note',
         });
-        const server = await ds.findServerById(serverId);
-        assert.equal(server.name, 'main');
-        assert.equal(Number(server.port), 24872);
-        assert.equal(server.password, 'pw');
-        await ds.updateServer(serverId, { name: 'main2', port: 24900 });
-        const changed = await ds.findServerById(serverId);
-        assert.equal(changed.name, 'main2');
-        assert.equal(Number(changed.port), 24900);
-        assert.equal(changed.host, '10.0.0.1', 'an unspecified field is untouched');
-        assert.equal((await ds.listServers()).length, 1);
+        let mapping = await ds.findMappingById(mappingId);
+        assert.equal(mapping.name, 'map-1');
+        assert.equal(Number(mapping.local_port), 25000);
+        assert.equal(mapping.target_host, 'www.example.com', `${label}: target host round-trips`);
+        assert.equal(Number(mapping.target_port), 9901, `${label}: target port round-trips`);
+        assert.equal(mapping.password, 'pw');
+        assert.equal(Number(mapping.capacity), 4, `${label}: default capacity`);
+        assert.equal(mapping.state, 'stopped');
+        assert.equal(mapping.desired_state, 'stopped');
+        assert.equal(mapping.pid, null);
+        assert.equal(mapping.extra_args, '[]');
 
-        const dupServer = await ds.createServer({ name: 'main2', host: 'x', port: 1 })
+        // Camel-case update fields must land on their snake_case columns.
+        await ds.updateMapping(mappingId, {
+            state: 'running',
+            pid: 4242,
+            extraArgs: ['--a', '--b'],
+            targetPort: 9902,
+        });
+        mapping = await ds.findMappingById(mappingId);
+        assert.equal(mapping.state, 'running');
+        assert.equal(Number(mapping.pid), 4242);
+        assert.deepEqual(JSON.parse(mapping.extra_args), ['--a', '--b'], `${label}: extra_args round-trips`);
+        assert.equal(Number(mapping.target_port), 9902, `${label}: targetPort alias reaches target_port`);
+        assert.equal(mapping.name, 'map-1', 'an unspecified column is untouched');
+
+        assert.equal((await ds.findMappingByName('map-1')).id, mappingId);
+        assert.equal(await ds.findMappingByName('nope'), undefined);
+
+        const secondId = await ds.createMapping({
+            name: 'map-2',
+            localPort: 25001,
+            targetHost: '10.0.0.2',
+            targetPort: 24872,
+            profile: 'legacy',
+        });
+        const usedPorts = await ds.listUsedLocalPorts();
+        assert.ok(Array.isArray(usedPorts), `${label}: listUsedLocalPorts returns an array`);
+        assert.ok(usedPorts.includes(25000) && usedPorts.includes(25001), `${label}: both local ports are listed`);
+
+        // The local port is UNIQUE: two mappings may not claim the same one.
+        const dupPort = await ds.createMapping({ name: 'map-3', localPort: 25000, targetHost: 'x', targetPort: 1 })
             .then(() => null, (error) => error);
-        assert.ok(dupServer instanceof Error, `${label}: duplicate server name must be rejected`);
+        assert.ok(dupPort instanceof Error, `${label}: duplicate local_port must be rejected`);
 
-        // ---- rooms ----
-        const roomId = await ds.createRoom({
-            name: 'room-1',
-            serverId,
-            citraPort: 25000,
-            roomPort: 24000,
-            listenAddress: '0.0.0.0',
-            password: 'secret',
-            profile: 'default',
-        });
-        let room = await ds.findRoomById(roomId);
-        assert.equal(room.name, 'room-1');
-        assert.equal(Number(room.citra_port), 25000);
-        assert.equal(room.state, 'stopped');
-        assert.equal(room.desired_state, 'stopped');
-        assert.equal(room.pid, null);
-        assert.equal(room.extra_args, '[]');
-
-        await ds.updateRoom(roomId, {
-            state: 'running', pid: 4242, desired_state: 'running', extraArgs: ['--a', '--b'],
-        });
-        room = await ds.findRoomById(roomId);
-        assert.equal(room.state, 'running');
-        assert.equal(Number(room.pid), 4242);
-        assert.deepEqual(JSON.parse(room.extra_args), ['--a', '--b'], `${label}: extra_args round-trips`);
-        assert.equal(room.name, 'room-1', 'an unspecified column is untouched');
-
-        assert.equal((await ds.findRoomByName('room-1')).id, roomId);
-        assert.equal(await ds.findRoomByName('nope'), undefined);
-
-        const secondId = await ds.createRoom({
-            name: 'room-2', serverId, citraPort: 25001, roomPort: 24001, profile: 'legacy',
-        });
-        const ports = await ds.listUsedPorts();
-        assert.ok(ports.citra instanceof Set, `${label}: listUsedPorts returns Sets`);
-        assert.equal(ports.citra.has(25000) && ports.citra.has(25001) || ports.citra.has(25000), true);
-        assert.ok(ports.room.has(24000));
-
-        const dupRoom = await ds.createRoom({ name: 'room-1', serverId, citraPort: 1, roomPort: 2 })
+        const dupName = await ds.createMapping({ name: 'map-1', localPort: 25999, targetHost: 'x', targetPort: 1 })
             .then(() => null, (error) => error);
-        assert.ok(dupRoom instanceof Error, `${label}: duplicate room name must be rejected`);
-
-        // Deleting the server must not orphan the room rows into an error state.
-        await ds.deleteServer(serverId);
-        room = await ds.findRoomById(roomId);
-        assert.notEqual(room, undefined, 'the room survives its server being deleted');
-        assert.equal(room.server_id, null, `${label}: server_id is nulled by ON DELETE SET NULL`);
+        assert.ok(dupName instanceof Error, `${label}: duplicate mapping name must be rejected`);
 
         // ---- events ----
-        await ds.addEvent({ roomId, kind: 'room.started', detail: 'pid=1', actor: 'tester' });
+        await ds.addEvent({ mappingId, kind: 'mapping.started', detail: 'pid=1', actor: 'tester' });
         await ds.addEvent({ kind: 'auth.login', detail: 'ok', actor: 'tester' });
         const events = await ds.listEvents({ limit: 10 });
         assert.equal(events.length, 2);
         assert.equal(events[0].kind, 'auth.login', `${label}: newest event first`);
-        const roomEvents = await ds.listEvents({ roomId, limit: 10 });
-        assert.equal(roomEvents.length, 1);
-        assert.equal(roomEvents[0].kind, 'room.started');
+        const mappingEvents = await ds.listEvents({ mappingId, limit: 10 });
+        assert.equal(mappingEvents.length, 1);
+        assert.equal(mappingEvents[0].kind, 'mapping.started');
+        assert.equal(Number(mappingEvents[0].mapping_id), Number(mappingId), `${label}: event carries mapping_id`);
 
         const prunedEvents = await ds.pruneEvents(Date.now() + 1000);
         assert.ok(prunedEvents >= 2, `${label}: pruneEvents removes old rows`);
         assert.equal((await ds.listEvents({ limit: 10 })).length, 0);
 
-        // ---- delete room / cascade ----
-        await ds.deleteRoom(secondId);
-        assert.equal(await ds.findRoomById(secondId), undefined);
+        // ---- delete mapping ----
+        await ds.deleteMapping(secondId);
+        assert.equal(await ds.findMappingById(secondId), undefined);
+        assert.equal((await ds.listUsedLocalPorts()).includes(25001), false, 'deleting frees the local port');
+
 
         // ---- delete user ----
         await ds.deleteUser(bobId);
@@ -238,14 +233,16 @@ test('SQLite: data survives reopen, schema version is enforced', async () => {
         await first.init();
         await first.createUser({ username: 'persist', passwordHash: 'h', role: 'owner' });
         await first.setSetting('marker', 'kept');
-        const roomId = await first.createRoom({ name: 'r', serverId: null, citraPort: 1, roomPort: 2 });
+        const mappingId = await first.createMapping({
+            name: 'r', localPort: 25000, targetHost: '1.2.3.4', targetPort: 9901,
+        });
         await first.close();
 
         const second = new SqliteDatasource({ path });
         await second.init();
         assert.equal(await second.countUsers(), 1, 'users persist');
         assert.equal(await second.getSetting('marker'), 'kept', 'settings persist');
-        assert.equal((await second.findRoomById(roomId)).name, 'r', 'rooms persist');
+        assert.equal((await second.findMappingById(mappingId)).name, 'r', 'mappings persist');
         // Re-running init() on an existing database must be a no-op migration.
         await second.init();
         assert.equal(await second.countUsers(), 1);
@@ -266,7 +263,7 @@ test('SQLite: a future schema version is refused instead of silently used', asyn
         await first.close();
 
         const second = new SqliteDatasource({ path });
-        await assert.rejects(() => second.init(), /schema version 99 is not supported/);
+        await assert.rejects(() => second.init(), /schema version 99 is newer than this build supports/);
         await second.close();
     } finally {
         rmSync(root, { recursive: true, force: true });

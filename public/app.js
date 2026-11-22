@@ -13,12 +13,12 @@ const CSRF_HEADER = 'x-csrf-token';
 const state = {
     session: null,          // { setupComplete, authenticated, csrfToken, user, ... }
     route: 'dashboard',
-    rooms: [],
-    servers: [],
+    mappings: [],           // rows from /api/mappings or /api/dashboard
     events: [],
     users: [],
     diagnostics: null,
     counts: null,
+    localPortRange: null,
     busy: new Set(),        // ids of in-flight operations, for button spinners
     refreshTimer: null,
     lastRefresh: null,
@@ -323,8 +323,7 @@ function renderAuth({ mode = 'login', notice = null } = {}) {
 
 const NAV = [
     { id: 'dashboard', label: '总览' },
-    { id: 'rooms', label: '房间' },
-    { id: 'servers', label: '房间服务器' },
+    { id: 'mappings', label: '端口映射' },
     { id: 'events', label: '事件记录' },
     { id: 'users', label: '账户', role: 'admin' },
     { id: 'settings', label: '设置' },
@@ -400,8 +399,7 @@ async function renderRoute() {
     }
     try {
         if (state.route === 'dashboard') await viewDashboard(main);
-        else if (state.route === 'rooms') await viewRooms(main);
-        else if (state.route === 'servers') await viewServers(main);
+        else if (state.route === 'mappings') await viewMappings(main);
         else if (state.route === 'events') await viewEvents(main);
         else if (state.route === 'users') await viewUsers(main);
         else if (state.route === 'settings') await viewSettings(main);
@@ -436,21 +434,20 @@ function stopRefresh() {
         state.refreshTimer = null;
     }
 }
-
 // ---------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------
 
 async function viewDashboard(main) {
     const data = await api('/api/dashboard');
-    state.rooms = data.rooms;
-    state.servers = data.servers;
+    state.mappings = data.mappings;
     state.counts = data.counts;
+    state.localPortRange = data.localPortRange ?? null;
     state.lastRefresh = Date.now();
 
     const stats = h('div', { class: 'grid-stats' },
         h('div', { class: 'stat' },
-            h('div', { class: 'stat-label' }, '房间总数'),
+            h('div', { class: 'stat-label' }, '映射总数'),
             h('div', { class: 'stat-value' }, String(data.counts.total))),
         h('div', { class: 'stat' },
             h('div', { class: 'stat-label' }, '运行中'),
@@ -468,36 +465,38 @@ async function viewDashboard(main) {
         blocks.push(h('div', { class: 'notice warn' },
             h('strong', {}, '未找到网关程序'),
             h('p', {}, data.gatewayBinaryError || '请在配置中设置 gateways.binaryPath，或把 citra-gateway 放入 bin 目录。'),
-            h('p', { class: 'small' }, '在找到网关程序之前，房间可以创建但无法启动。')));
-    }
-    if (data.counts.total === 0) {
-        blocks.push(h('div', { class: 'notice info' },
-            h('p', {}, '还没有任何房间。先添加一台房间服务器，然后创建房间即可批量管理网关。'),
-            h('div', { class: 'btn-row' },
-                h('button', { class: 'primary', onClick: () => navigate('servers') }, '添加房间服务器'),
-                h('button', { onClick: () => navigate('rooms') }, '直接去房间页'))));
+            h('p', { class: 'small' }, '在找到网关程序之前，映射可以创建但无法启动。')));
     }
 
-    const running = data.rooms.filter((room) => room.state === 'running' || room.state === 'failed');
-    if (running.length > 0) {
-        const rows = running.slice(0, 8).map((room) => h('tr', {},
-            h('td', {}, room.name),
-            h('td', {}, badgeFor(room.state)),
-            h('td', { class: 'num' }, String(room.citraPort)),
-            h('td', {}, room.serverName ? `${room.serverName} (${room.serverHost}:${room.serverPort})` : h('span', { class: 'muted' }, '未绑定')),
-            h('td', {}, room.state === 'running' ? fmtDuration(room.startedAt) : h('span', { class: 'muted' }, room.failure || '—')),
+    if (data.counts.total === 0) {
+        blocks.push(h('div', { class: 'notice info' },
+            h('p', {}, '还没有任何端口映射。一条映射 = 一个本地端口对应一台房间服务器。'),
+            h('div', { class: 'btn-row' },
+                h('button', { class: 'primary', onClick: () => navigate('mappings') }, '去添加映射'))));
+    }
+
+    const active = data.mappings.filter((row) => row.state === 'running' || row.state === 'failed');
+    if (active.length > 0) {
+        const rows = active.slice(0, 8).map((row) => h('tr', {},
+            h('td', {}, row.name),
+            h('td', {}, badgeFor(row.state)),
+            h('td', { class: 'num' }, String(row.localPort)),
+            h('td', { class: 'mono' }, `${row.targetHost}:${row.targetPort}`),
+            h('td', {}, row.state === 'running'
+                ? fmtDuration(row.startedAt)
+                : h('span', { class: 'muted' }, row.failure || '—')),
             h('td', { class: 'actions' },
-                h('button', { class: 'small', onClick: () => openLog(room) }, '日志'))));
+                h('button', { class: 'small', onClick: () => openLog(row) }, '日志'))));
+        const activeTable = h('table', { style: 'min-width:620px' },
+            h('thead', {}, h('tr', {},
+                h('th', {}, '名称'), h('th', {}, '状态'), h('th', {}, '本地端口'),
+                h('th', {}, '目标服务器'), h('th', {}, '运行时长 / 原因'), h('th', {}, ''))),
+            h('tbody', {}, rows));
         blocks.push(h('section', { class: 'card' },
             h('div', { class: 'card-head' },
-                h('div', {}, h('h2', {}, '需要关注的房间'),
-                    h('p', { class: 'hint' }, '运行中与异常的房间。异常房间的失败原因见“房间”页。'))),
-            h('div', { class: 'table-wrap' },
-                h('table', {},
-                    h('thead', {}, h('tr', {},
-                        h('th', {}, '房间'), h('th', {}, '状态'), h('th', {}, 'Citra 端口'),
-                        h('th', {}, '房间服务器'), h('th', {}, '运行时长 / 原因'), h('th', {}, ''))),
-                    h('tbody', {}, rows)))));
+                h('div', {}, h('h2', {}, '需要关注的映射'),
+                    h('p', { class: 'hint' }, '运行中与异常的映射。异常原因见「端口映射」页。'))),
+            h('div', { class: 'table-wrap' }, activeTable)));
     }
 
     if (data.events.length > 0) {
@@ -526,307 +525,263 @@ async function viewDashboard(main) {
 }
 
 // ---------------------------------------------------------------------------
-// Rooms
+// Mappings
 // ---------------------------------------------------------------------------
 
-let selectedRooms = new Set();
+let selectedMappings = new Set();
 
-async function viewRooms(main) {
-    const [rooms, servers] = await Promise.all([api('/api/rooms'), api('/api/servers')]);
-    state.rooms = rooms;
-    state.servers = servers;
+async function viewMappings(main) {
+    const mappings = await api('/api/mappings');
+    state.mappings = mappings;
     const canEdit = state.session.user.role === 'admin' || state.session.user.role === 'owner';
 
     // Drop selections that no longer exist (e.g. deleted in another tab).
-    for (const id of [...selectedRooms]) {
-        if (!rooms.some((room) => room.id === id)) selectedRooms.delete(id);
+    for (const id of [...selectedMappings]) {
+        if (!mappings.some((row) => row.id === id)) selectedMappings.delete(id);
     }
 
     const head = h('div', { class: 'card-head' },
-        h('div', {}, h('h2', {}, '房间'),
+        h('div', {}, h('h2', {}, '端口映射'),
             h('p', { class: 'hint' },
-                '每个房间是一个独立的网关进程。玩家把 Citra 连接到房间的 Citra 端口，Yuzu 在游戏内加入对应厅。')),
+                '一条映射就是一对：本地端口（玩家连这个）→ 目标房间服务器。批量启动后每个映射各占一个网关进程。')),
         h('div', { class: 'btn-row' },
-            h('button', { onClick: () => refreshRooms() }, '刷新'),
-            canEdit ? h('button', { class: 'primary', onClick: () => openRoomDialog(null, servers) }, '新建房间') : null));
+            h('button', { onClick: () => viewMappings(main) }, '刷新'),
+            canEdit ? h('button', { class: 'primary', onClick: () => openMappingDialog(null) }, '新建映射') : null));
 
-    const notice = servers.length === 0
-        ? h('div', { class: 'notice warn' },
-            h('p', {}, '还没有可用的房间服务器。房间必须绑定一台房间服务器才能启动。'),
-            h('div', { class: 'btn-row' }, h('button', { onClick: () => navigate('servers') }, '去添加房间服务器')))
-        : null;
+    if (mappings.length === 0) {
+        main.replaceChildren(h('section', { class: 'card' }, head,
+            h('div', { class: 'empty' },
+                h('strong', {}, '还没有端口映射'),
+                h('p', {}, '新建一条映射：选一个本地端口，填上房间服务器的地址和端口，再批量启动即可。'))));
+        return;
+    }
 
-    const body = rooms.length === 0
-        ? h('div', { class: 'empty' },
-            h('strong', {}, '还没有房间'),
-            h('p', {}, '创建第一个房间后，可以在这里批量启动、停止并查看日志。'))
-        : h('div', { class: 'table-wrap' },
-            h('table', {},
-                h('thead', {}, h('tr', {},
-                    canEdit ? h('th', { style: 'width:36px' },
-                        h('input', {
-                            type: 'checkbox',
-                            'aria-label': '全选',
-                            checked: rooms.length > 0 && selectedRooms.size === rooms.length,
-                            onChange: (event) => {
-                                if (event.target.checked) rooms.forEach((room) => selectedRooms.add(room.id));
-                                else selectedRooms.clear();
-                                refreshRooms();
-                            },
-                        })) : null,
-                    h('th', {}, '房间'),
-                    h('th', {}, '状态'),
-                    h('th', {}, 'Citra 端口'),
-                    h('th', {}, '房间服务器'),
-                    h('th', {}, '配置档'),
-                    h('th', {}, '运行时长'),
-                    h('th', {}, canEdit ? '操作' : ''))),
-                h('tbody', {}, rooms.map((room) => roomRow(room, { canEdit, servers })))));
+    const rows = mappings.map((row) => mappingRow(row, { canEdit }));
+    const table = h('table', { style: 'min-width:900px' },
+        h('thead', {}, h('tr', {},
+            canEdit ? h('th', { style: 'width:36px' }, '') : null,
+            h('th', {}, '名称'),
+            h('th', {}, '本地端口'),
+            h('th', {}, '目标服务器'),
+            h('th', {}, '密码'),
+            h('th', {}, '配置档'),
+            h('th', {}, '状态'),
+            h('th', {}, '运行时长 / 原因'),
+            h('th', {}, '操作'))),
+        h('tbody', {}, rows));
 
-    const batchBar = canEdit && rooms.length > 0
-        ? h('div', { class: 'card', style: 'margin-bottom:16px' },
-            h('div', { class: 'spread', style: 'flex-wrap:wrap' },
-                h('span', { class: 'small muted' }, `已选择 ${selectedRooms.size} 个房间`),
-                h('div', { class: 'btn-row' },
-                    h('button', {
-                        disabled: selectedRooms.size === 0,
-                        onClick: () => batch('start'),
-                    }, '批量启动'),
-                    h('button', {
-                        disabled: selectedRooms.size === 0,
-                        onClick: () => batch('stop'),
-                    }, '批量停止'),
-                    h('button', {
-                        disabled: selectedRooms.size === 0,
-                        onClick: () => {
-                            if (!confirm(`确定要删除选中的 ${selectedRooms.size} 个房间吗？正在运行的房间会先被停止。`)) return;
-                            (async () => {
-                                for (const id of [...selectedRooms]) {
-                                    try {
-                                        await api(`/api/rooms/${id}`, { method: 'DELETE' });
-                                    } catch (error) {
-                                        fail(error);
-                                    }
-                                }
-                                selectedRooms.clear();
-                                toast('已删除选中的房间');
-                                await refreshRooms();
-                            })();
-                        },
-                    }, '批量删除'))))
-        : null;
-
-    main.replaceChildren(
-        h('section', { class: 'card' }, head, notice, body),
-        batchBar ?? h('div'),
-    );
+    const batchBar = canEdit ? buildBatchBar(mappings) : null;
+    main.replaceChildren(h('section', { class: 'card' }, head, batchBar,
+        h('div', { class: 'table-wrap' }, table)));
 
     startRefresh(async () => {
-        if (state.route !== 'rooms') return;
-        const fresh = await api('/api/rooms');
-        state.rooms = fresh;
-        // Update only the volatile cells so an open dialog or in-progress click
-        // is not destroyed by the refresh.
-        for (const room of fresh) {
-            const row = document.querySelector(`tr[data-room="${room.id}"]`);
-            if (!row) { await refreshRooms(); return; }
-            const stateCell = row.querySelector('[data-cell="state"]');
-            if (stateCell) stateCell.replaceChildren(badgeFor(room.state));
-            const uptimeCell = row.querySelector('[data-cell="uptime"]');
-            if (uptimeCell) uptimeCell.textContent = room.state === 'running' ? fmtDuration(room.startedAt) : '—';
-            const failureCell = row.querySelector('[data-cell="failure"]');
-            if (failureCell) failureCell.textContent = room.failure || '';
-        }
+        if (state.route === 'mappings') await viewMappings(document.getElementById('main'));
     }, 4000);
 }
 
-function roomRow(room, { canEdit, servers }) {
-    const busy = state.busy.has(`room-${room.id}`);
-    const canStart = canEdit && !busy && room.state !== 'running' && room.state !== 'starting' && room.serverId;
-    const canStop = canEdit && !busy && (room.state === 'running' || room.state === 'starting');
-    return h('tr', { dataset: { room: String(room.id) } },
-        canEdit ? h('td', {},
+/** The selection bar above the table: count, select-all, batch buttons. */
+function buildBatchBar(mappings) {
+    const label = h('span', { class: 'small muted' }, `已选择 ${selectedMappings.size} 个映射`);
+    const bar = h('div', { class: 'batch-bar' },
+        label,
+        h('div', { class: 'btn-row' },
+            h('button', {
+                class: 'small',
+                onClick: (event) => {
+                    if (selectedMappings.size === mappings.length) selectedMappings = new Set();
+                    else selectedMappings = new Set(mappings.map((row) => row.id));
+                    refreshSelectionUI(event?.target);
+                    viewMappings(document.getElementById('main'));
+                },
+            }, selectedMappings.size === mappings.length ? '取消全选' : '全选'),
+            h('button', { class: 'small primary', onClick: () => batch('start') }, '批量启动'),
+            h('button', { class: 'small', onClick: () => batch('stop') }, '批量停止')));
+    return bar;
+}
+
+function refreshSelectionUI() {
+    // Selection lives in `selectedMappings`; the table is re-rendered after a change,
+    // so there is nothing to patch in place. Kept as a named hook for clarity.
+}
+
+function mappingRow(mapping, { canEdit }) {
+    const running = mapping.state === 'running';
+    const selected = selectedMappings.has(mapping.id);
+    const checkbox = canEdit
+        ? h('td', {},
             h('input', {
                 type: 'checkbox',
-                'aria-label': `选择 ${room.name}`,
-                checked: selectedRooms.has(room.id),
+                checked: selected,
                 onChange: (event) => {
-                    if (event.target.checked) selectedRooms.add(room.id);
-                    else selectedRooms.delete(room.id);
-                    const bar = document.querySelector('.card .spread .small.muted');
-                    if (bar) bar.textContent = `已选择 ${selectedRooms.size} 个房间`;
+                    if (event.target.checked) selectedMappings.add(mapping.id);
+                    else selectedMappings.delete(mapping.id);
                 },
-            })) : null,
-        h('td', {},
-            h('div', { style: 'font-weight:600' }, room.name),
-            room.failure ? h('div', { class: 'small', style: 'color:var(--danger)', 'data-cell': 'failure' }, room.failure) : null),
-        h('td', { 'data-cell': 'state' }, badgeFor(room.state)),
-        h('td', { class: 'num' }, String(room.citraPort)),
-        h('td', {},
-            room.serverName
-                ? h('div', {}, `${room.serverName}`, h('div', { class: 'small muted' }, `${room.serverHost}:${room.serverPort}`))
-                : h('span', { class: 'muted' }, '未绑定')),
-        h('td', {}, room.profile === 'legacy' ? '兼容模式' : room.profile === 'dual-host' ? '双房主' : '标准'),
-        h('td', { class: 'nowrap', 'data-cell': 'uptime' }, room.state === 'running' ? fmtDuration(room.startedAt) : '—'),
-        h('td', { class: 'actions' },
-            canStart ? h('button', { class: 'small', onClick: () => roomAction(room, 'start') }, '启动') : null,
-            canStop ? h('button', { class: 'small', onClick: () => roomAction(room, 'stop') }, '停止') : null,
-            h('button', { class: 'small', onClick: () => openLog(room) }, '日志'),
-            canEdit ? h('button', { class: 'small', onClick: () => openRoomDialog(room, servers) }, '编辑') : null,
-            canEdit ? h('button', {
+            }))
+        : null;
+
+    const actions = h('td', { class: 'actions' },
+        canEdit
+            ? h('button', {
+                class: 'small',
+                onClick: () => mappingAction(mapping, running ? 'stop' : 'start'),
+                'data-state': running ? 'stop' : 'start',
+            }, running ? '停止' : '启动')
+            : null,
+        h('button', { class: 'small', onClick: () => openLog(mapping) }, '日志'),
+        canEdit ? h('button', { class: 'small', onClick: () => openMappingDialog(mapping) }, '编辑') : null,
+        canEdit
+            ? h('button', {
                 class: 'small danger',
-                onClick: () => {
-                    if (!confirm(`确定要删除房间“${room.name}”吗？`)) return;
-                    api(`/api/rooms/${room.id}`, { method: 'DELETE' })
-                        .then(() => { toast('房间已删除'); return refreshRooms(); })
-                        .catch(fail);
+                onClick: async () => {
+                    if (!confirm(`确定要删除映射“${mapping.name}”吗？`)) return;
+                    try {
+                        await api(`/api/mappings/${mapping.id}`, { method: 'DELETE' });
+                        toast('映射已删除');
+                        await viewMappings(document.getElementById('main'));
+                    } catch (error) {
+                        fail(error);
+                    }
                 },
-            }, '删除') : null),
-    );
+            }, '删除')
+            : null);
+
+    return h('tr', {},
+        checkbox,
+        h('td', { style: 'font-weight:600' }, mapping.name),
+        h('td', { class: 'num mono' }, String(mapping.localPort)),
+        h('td', { class: 'mono' }, `${mapping.targetHost}:${mapping.targetPort}`),
+        h('td', {}, mapping.hasPassword ? '已设置' : h('span', { class: 'muted' }, '无')),
+        h('td', {}, mapping.profile === 'legacy' ? 'legacy' : '标准'),
+        h('td', {}, badgeFor(mapping.state)),
+        h('td', {}, running
+            ? fmtDuration(mapping.startedAt)
+            : h('span', { class: 'muted' }, mapping.failure || '—')),
+        actions);
 }
 
-async function refreshRooms() {
-    // Re-render in place; keeps checkboxes and scroll position for the operator.
-    const main = document.getElementById('main');
-    if (main && state.route === 'rooms') await viewRooms(main);
-}
-
-async function roomAction(room, action) {
-    const key = `room-${room.id}`;
-    state.busy.add(key);
+async function mappingAction(mapping, action) {
     try {
-        const result = await api(`/api/rooms/${room.id}/${action}`, { method: 'POST' });
-        if (action === 'start' && result?.state === 'failed') {
-            toast(`启动失败：${result.failure || '未知原因'}`, 'error', 7000);
-        } else {
-            toast(action === 'start' ? `已启动 ${room.name}` : `已停止 ${room.name}`);
-        }
+        await api(`/api/mappings/${mapping.id}/${action}`, { method: 'POST' });
+        toast(action === 'start' ? '已启动' : '已停止');
     } catch (error) {
         fail(error);
-    } finally {
-        state.busy.delete(key);
-        await refreshRooms();
     }
+    await viewMappings(document.getElementById('main'));
 }
 
 async function batch(action) {
-    const ids = [...selectedRooms];
-    if (ids.length === 0) return;
+    if (selectedMappings.size === 0) {
+        toast('请先选择要操作的映射', 'warn');
+        return;
+    }
+    const ids = [...selectedMappings];
     try {
-        const result = await api(`/api/rooms/batch/${action}`, { method: 'POST', body: { ids } });
-        if (result.failed === 0) {
-            toast(`已${action === 'start' ? '启动' : '停止'} ${result.succeeded} 个房间`);
-        } else {
-            const reasons = result.results.filter((item) => !item.ok)
-                .map((item) => `· ${item.name ?? `#${item.id}`}: ${item.error ?? '未知原因'}`)
-                .join('\n');
-            toast(`${action === 'start' ? '启动' : '停止'}成功 ${result.succeeded} 个，失败 ${result.failed} 个`, 'warn', 9000);
-            showBatchErrors(action, reasons);
-        }
+        const result = await api(`/api/mappings/batch/${action}`, { method: 'POST', body: { ids } });
+        const text = `${action === 'start' ? '启动' : '停止'}成功 ${result.succeeded} 个，失败 ${result.failed} 个`;
+        toast(text, result.failed > 0 ? 'warn' : 'success');
+        if (result.failed > 0) showBatchErrors(action, result);
     } catch (error) {
         fail(error);
-    } finally {
-        await refreshRooms();
     }
+    await viewMappings(document.getElementById('main'));
 }
 
-function showBatchErrors(action, text) {
-    const dialog = h('dialog', { open: true },
-        h('div', { style: 'padding:20px' },
-            h('div', { class: 'dialog-head' },
-                h('h2', {}, `批量${action === 'start' ? '启动' : '停止'}部分失败`),
-                h('p', { class: 'hint' }, '成功的房间已经生效，下面是失败原因。')),
-            h('pre', {}, text),
-            h('div', { class: 'dialog-actions' },
-                h('button', { class: 'primary', onClick: () => { dialog.close(); dialog.remove(); } }, '知道了'))));
-    document.body.append(dialog);
+/** Show which rows failed and why, instead of only a count. */
+function showBatchErrors(action, result) {
+    const failed = result.results.filter((item) => !item.ok);
+    const list = h('ul', { style: 'margin:8px 0 0 18px' },
+        ...failed.slice(0, 10).map((item) => h('li', {},
+            `${item.name ?? `#${item.id}`}：${item.error ?? '未知原因'}`)));
+    const notice = h('div', { class: 'notice warn' },
+        h('strong', {}, `批量${action === 'start' ? '启动' : '停止'}有 ${failed.length} 个映射失败`),
+        list);
+    const main = document.getElementById('main');
+    if (main) main.prepend(notice);
 }
 
-// ---- room create/edit dialog ---------------------------------------------
-
-function openRoomDialog(room, servers) {
-    const editing = Boolean(room);
-    const name = h('input', { type: 'text', value: room?.name ?? '', maxlength: 32, required: true, placeholder: '例如 大厅-1' });
-    const serverSelect = h('select', {},
-        servers.map((server) => h('option', {
-            value: String(server.id),
-            selected: room ? server.id === room.serverId : servers.length === 1,
-        }, `${server.name} (${server.host}:${server.port})`)));
-    const citraPort = h('input', {
-        type: 'number', min: 1, max: 65535,
-        value: room?.citraPort ?? '',
-        placeholder: '留空自动分配',
+function openMappingDialog(mapping) {
+    const editing = Boolean(mapping);
+    const name = h('input', {
+        type: 'text', value: mapping?.name ?? '', maxlength: 64, placeholder: '留空则按端口自动命名',
     });
-    const roomPort = h('input', {
-        type: 'number', min: 1, max: 65535,
-        value: room?.roomPort ?? '',
-        placeholder: '留空自动分配',
+    const localPort = h('input', {
+        type: 'number', value: mapping?.localPort ?? '', min: 1, max: 65535,
+        placeholder: '留空则自动从端口池分配',
     });
-    const listen = h('input', { type: 'text', value: room?.listenAddress ?? '0.0.0.0', placeholder: '0.0.0.0' });
+    const targetHost = h('input', {
+        type: 'text', value: mapping?.targetHost ?? '', required: true,
+        placeholder: '例如 1.2.3.4 或 room.example.com（不要带端口）',
+    });
+    const targetPort = h('input', {
+        type: 'number', value: mapping?.targetPort ?? '', min: 1, max: 65535, required: true,
+        placeholder: '目标服务器自己的端口，例如 24872 或 9901',
+    });
     const password = h('input', {
-        type: 'password',
-        value: '',
-        placeholder: room?.hasPassword ? '已设置，留空表示不修改' : '可留空表示无密码',
+        type: 'password', value: '',
+        placeholder: mapping?.hasPassword ? '已设置，留空表示不修改' : '可留空',
         autocomplete: 'new-password',
     });
     const profile = h('select', {},
-        h('option', { value: 'default', selected: (room?.profile ?? 'default') === 'default' }, '标准（MHXX ↔ MHGU 互转）'),
-        h('option', { value: 'dual-host', selected: room?.profile === 'dual-host' }, '双房主'),
-        h('option', { value: 'legacy', selected: room?.profile === 'legacy' }, '兼容模式（仅数据面转发）'));
-
+        h('option', { value: 'default' }, '标准（完整翻译）'),
+        h('option', { value: 'legacy' }, 'legacy（仅数据面）'));
+    profile.value = mapping?.profile === 'legacy' ? 'legacy' : 'default';
+    const capacity = h('input', { type: 'number', value: mapping?.capacity ?? 4, min: 1, max: 64 });
+    const notes = h('textarea', { placeholder: '可选，例如负责的公会' }, mapping?.notes ?? '');
     const errorBox = h('div', { hidden: true });
-    const submit = h('button', { class: 'primary', type: 'submit' }, editing ? '保存' : '创建');
 
-    const dialog = h('dialog', {},
-        h('form', {
-            onSubmit: async (event) => {
-                event.preventDefault();
-                errorBox.hidden = true;
-                submit.disabled = true;
-                const body = {
-                    name: name.value,
-                    serverId: Number(serverSelect.value),
-                    listenAddress: listen.value,
-                    profile: profile.value,
-                };
-                if (citraPort.value !== '') body.citraPort = Number(citraPort.value);
-                if (roomPort.value !== '') body.roomPort = Number(roomPort.value);
-                if (password.value !== '') body.password = password.value;
-                try {
-                    if (editing) await api(`/api/rooms/${room.id}`, { method: 'PATCH', body });
-                    else await api('/api/rooms', { method: 'POST', body });
-                    dialog.close();
-                    dialog.remove();
-                    toast(editing ? '房间已保存' : '房间已创建');
-                    await refreshRooms();
-                } catch (error) {
-                    errorBox.hidden = false;
-                    errorBox.className = 'notice error';
-                    errorBox.replaceChildren(h('p', {}, error?.message ?? '保存失败'));
-                    submit.disabled = false;
-                }
-            },
+    const submit = h('button', {
+        class: 'primary',
+        onClick: async (event) => {
+            event.preventDefault();
+            const body = {
+                name: name.value.trim(),
+                targetHost: targetHost.value.trim(),
+                targetPort: targetPort.value,
+                profile: profile.value,
+                capacity: capacity.value,
+                notes: notes.value,
+            };
+            // Only send the port when it was typed; an empty field means "allocate one"
+            // on create, and "leave it alone" on edit.
+            if (String(localPort.value).trim() !== '') body.localPort = localPort.value;
+            if (String(password.value) !== '') body.password = password.value;
+            submit.disabled = true;
+            try {
+                if (editing) await api(`/api/mappings/${mapping.id}`, { method: 'PATCH', body });
+                else await api('/api/mappings', { method: 'POST', body });
+                dialog.close();
+                dialog.remove();
+                toast(editing ? '映射已保存' : '映射已添加');
+                await viewMappings(document.getElementById('main'));
+            } catch (error) {
+                errorBox.hidden = false;
+                errorBox.className = 'notice error';
+                errorBox.replaceChildren(h('p', {}, error?.message ?? '保存失败'));
+                submit.disabled = false;
+            }
         },
-        h('div', { class: 'dialog-head' },
-            h('h2', {}, editing ? `编辑房间 ${room.name}` : '新建房间'),
-            h('p', { class: 'hint' }, '端口留空会根据配置的端口池自动分配，避免冲突。')),
-        errorBox,
-        h('div', { class: 'field' }, h('label', {}, '房间名'), name),
-        h('div', { class: 'field' }, h('label', {}, '房间服务器'), serverSelect,
-            h('span', { class: 'sub' }, 'Yuzu 玩家加入的服务器，必须是已配置的服务器。')),
-        h('div', { class: 'field-row' },
-            h('div', { class: 'field' }, h('label', {}, 'Citra 接入端口'), citraPort,
-                h('span', { class: 'sub' }, 'Citra 玩家连接此端口')),
-            h('div', { class: 'field' }, h('label', {}, '房间服务器端口'), roomPort,
-                h('span', { class: 'sub' }, '网关向服务器声明的端口'))),
-        h('div', { class: 'field-row' },
-            h('div', { class: 'field' }, h('label', {}, '监听地址'), listen,
-                h('span', { class: 'sub' }, '0.0.0.0 表示接受外部连接')),
-            h('div', { class: 'field' }, h('label', {}, 'Citra 接入密码'), password)),
-        h('div', { class: 'field' }, h('label', {}, '配置档'), profile),
-        h('div', { class: 'dialog-actions' },
-            h('button', { type: 'button', onClick: () => { dialog.close(); dialog.remove(); } }, '取消'),
-            submit)),
+    }, editing ? '保存' : '添加');
+
+    const dialog = h('dialog', { class: 'dialog' },
+        h('form', { method: 'dialog', onSubmit: (event) => event.preventDefault() },
+            h('div', { class: 'dialog-head' }, h('h2', {}, editing ? `编辑映射 ${mapping.name}` : '新建端口映射')),
+            errorBox,
+            h('div', { class: 'field' }, h('label', {}, '名称'), name),
+            h('div', { class: 'field-row' },
+                h('div', { class: 'field' }, h('label', {}, '本地端口'), localPort,
+                    h('span', { class: 'sub' }, '玩家连这个 UDP 端口；留空则自动分配')),
+                h('div', { class: 'field' }, h('label', {}, '目标端口'), targetPort,
+                    h('span', { class: 'sub' }, '房间服务器自己的端口'))),
+            h('div', { class: 'field' }, h('label', {}, '目标服务器地址'), targetHost,
+                h('span', { class: 'sub' }, 'IPv4 或域名，不要带端口')),
+            h('div', { class: 'field' }, h('label', {}, '房间密码'), password),
+            h('div', { class: 'field-row' },
+                h('div', { class: 'field' }, h('label', {}, '配置档'), profile),
+                h('div', { class: 'field' }, h('label', {}, '房间容量'), capacity)),
+            h('div', { class: 'field' }, h('label', {}, '备注'), notes),
+            h('div', { class: 'dialog-actions' },
+                h('button', { type: 'button', onClick: () => { dialog.close(); dialog.remove(); } }, '取消'),
+                submit)),
     );
     dialog.addEventListener('close', () => dialog.remove());
     document.body.append(dialog);
@@ -834,159 +789,35 @@ function openRoomDialog(room, servers) {
     name.focus();
 }
 
-// ---- log viewer -----------------------------------------------------------
-
-async function openLog(room) {
-    const pre = h('pre', { class: 'log-view' }, '正在读取日志…');
-    const dialog = h('dialog', {},
-        h('div', { style: 'padding:20px' },
-            h('div', { class: 'dialog-head' },
-                h('h2', {}, `${room.name} 日志`),
-                h('p', { class: 'hint' }, '最近的输出，最多显示 200 行。')),
-            pre,
-            h('div', { class: 'dialog-actions' },
-                h('button', {
-                    type: 'button',
-                    onClick: async () => {
-                        try {
-                            const log = await api(`/api/rooms/${room.id}/log?lines=400`);
-                            pre.textContent = log.text || '（日志为空）';
-                        } catch (error) {
-                            fail(error);
-                        }
-                    },
-                }, '刷新'),
-                h('button', { class: 'primary', type: 'button', onClick: () => { dialog.close(); dialog.remove(); } }, '关闭'))));
+async function openLog(mapping) {
+    const dialog = h('dialog', { class: 'dialog wide' },
+        h('div', { class: 'dialog-head' },
+            h('h2', {}, `${mapping.name} 的日志`),
+            h('p', { class: 'hint' }, `本地 ${mapping.localPort} → ${mapping.targetHost}:${mapping.targetPort}`)));
+    const pre = h('pre', { class: 'log-view' }, '加载中…');
+    const actions = h('div', { class: 'dialog-actions' },
+        h('button', {
+            type: 'button',
+            onClick: async () => {
+                try {
+                    const log = await api(`/api/mappings/${mapping.id}/log?lines=400`);
+                    pre.textContent = log.text || '（日志为空）';
+                } catch (error) {
+                    fail(error);
+                }
+            },
+        }, '刷新'),
+        h('button', { type: 'button', class: 'primary', onClick: () => { dialog.close(); dialog.remove(); } }, '关闭'));
+    dialog.append(pre, actions);
     dialog.addEventListener('close', () => dialog.remove());
     document.body.append(dialog);
     dialog.showModal();
     try {
-        const log = await api(`/api/rooms/${room.id}/log?lines=400`);
-        pre.textContent = log.text || '（日志为空：房间可能从未启动过）';
+        const log = await api(`/api/mappings/${mapping.id}/log?lines=400`);
+        pre.textContent = log.text || '（日志为空：该映射可能从未启动过）';
     } catch (error) {
         pre.textContent = `读取日志失败：${error?.message ?? error}`;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Servers
-// ---------------------------------------------------------------------------
-
-async function viewServers(main) {
-    const servers = await api('/api/servers');
-    state.servers = servers;
-    stopRefresh();
-    const canEdit = state.session.user.role === 'admin' || state.session.user.role === 'owner';
-
-    const head = h('div', { class: 'card-head' },
-        h('div', {}, h('h2', {}, '房间服务器'),
-            h('p', { class: 'hint' }, 'Yuzu 玩家实际加入的房间服务器。房间会绑定其中一台。')),
-        h('div', { class: 'btn-row' },
-            canEdit ? h('button', { class: 'primary', onClick: () => openServerDialog(null) }, '添加服务器') : null));
-
-    // Built with named intermediates rather than one deeply nested expression: the
-    // nested form had six closing parentheses in a row and shipped with five, which
-    // is a syntax error that only appears when the browser parses this file.
-    let body;
-    if (servers.length === 0) {
-        body = h('div', { class: 'empty' },
-            h('strong', {}, '还没有房间服务器'),
-            h('p', {}, '先添加一台 yuzu-room 服务器，之后创建房间时选择它。'));
-    } else {
-        const rows = servers.map((server) => {
-            const actions = h('td', { class: 'actions' },
-                canEdit ? h('button', { class: 'small', onClick: () => openServerDialog(server) }, '编辑') : null,
-                canEdit ? h('button', {
-                    class: 'small danger',
-                    onClick: async () => {
-                        if (!confirm(`确定要删除服务器“${server.name}”吗？`)) return;
-                        try {
-                            await api(`/api/servers/${server.id}`, { method: 'DELETE' });
-                            toast('服务器已删除');
-                            await viewServers(main);
-                        } catch (error) {
-                            fail(error);
-                        }
-                    },
-                }, '删除') : null);
-            return h('tr', {},
-                h('td', { style: 'font-weight:600' }, server.name),
-                h('td', { class: 'mono' }, server.host),
-                h('td', { class: 'num' }, String(server.port)),
-                h('td', {}, server.hasPassword ? '已设置' : h('span', { class: 'muted' }, '无')),
-                h('td', {}, server.notes || h('span', { class: 'muted' }, '—')),
-                actions);
-        });
-        body = h('div', { class: 'table-wrap' },
-            h('table', { style: 'min-width:620px' },
-                h('thead', {}, h('tr', {},
-                    h('th', {}, '名称'), h('th', {}, '地址'), h('th', {}, '端口'),
-                    h('th', {}, '密码'), h('th', {}, '备注'), h('th', {}, canEdit ? '操作' : ''))),
-                h('tbody', {}, rows)));
-    }
-
-    main.replaceChildren(h('section', { class: 'card' }, head, body));
-}
-
-function openServerDialog(server) {
-    const editing = Boolean(server);
-    const name = h('input', { type: 'text', value: server?.name ?? '', maxlength: 64, required: true, placeholder: '例如 主服务器' });
-    const host = h('input', { type: 'text', value: server?.host ?? '', required: true, placeholder: '例如 192.168.1.10 或 room.example.com' });
-    const port = h('input', { type: 'number', value: server?.port ?? 24872, min: 1, max: 65535, required: true });
-    const password = h('input', {
-        type: 'password', value: '',
-        placeholder: server?.hasPassword ? '已设置，留空表示不修改' : '可留空',
-        autocomplete: 'new-password',
-    });
-    const notes = h('textarea', { placeholder: '可选，例如负责人或机房位置' }, server?.notes ?? '');
-    const errorBox = h('div', { hidden: true });
-    const submit = h('button', { class: 'primary', type: 'submit' }, editing ? '保存' : '添加');
-
-    const dialog = h('dialog', {},
-        h('form', {
-            onSubmit: async (event) => {
-                event.preventDefault();
-                errorBox.hidden = true;
-                submit.disabled = true;
-                const body = {
-                    name: name.value,
-                    host: host.value,
-                    port: Number(port.value),
-                    notes: notes.value,
-                };
-                if (password.value !== '') body.password = password.value;
-                try {
-                    if (editing) await api(`/api/servers/${server.id}`, { method: 'PATCH', body });
-                    else await api('/api/servers', { method: 'POST', body });
-                    dialog.close();
-                    dialog.remove();
-                    toast(editing ? '服务器已保存' : '服务器已添加');
-                    await viewServers(document.getElementById('main'));
-                } catch (error) {
-                    errorBox.hidden = false;
-                    errorBox.className = 'notice error';
-                    errorBox.replaceChildren(h('p', {}, error?.message ?? '保存失败'));
-                    submit.disabled = false;
-                }
-            },
-        },
-        h('div', { class: 'dialog-head' }, h('h2', {}, editing ? `编辑服务器 ${server.name}` : '添加房间服务器')),
-        errorBox,
-        h('div', { class: 'field' }, h('label', {}, '名称'), name),
-        h('div', { class: 'field-row' },
-            h('div', { class: 'field' }, h('label', {}, '地址'), host,
-                h('span', { class: 'sub' }, 'IPv4 或域名，不要带端口')),
-            h('div', { class: 'field' }, h('label', {}, '端口'), port)),
-        h('div', { class: 'field' }, h('label', {}, '房间密码'), password),
-        h('div', { class: 'field' }, h('label', {}, '备注'), notes),
-        h('div', { class: 'dialog-actions' },
-            h('button', { type: 'button', onClick: () => { dialog.close(); dialog.remove(); } }, '取消'),
-            submit)),
-    );
-    dialog.addEventListener('close', () => dialog.remove());
-    document.body.append(dialog);
-    dialog.showModal();
-    name.focus();
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,8 +1016,7 @@ async function viewSettings(main) {
             ['配置文件', diagnostics.configPath ?? '未使用配置文件（内置默认值）'],
             ['网关程序', diagnostics.gatewayBinary ?? '未找到'],
             ['网关程序问题', diagnostics.gatewayBinaryError || '无'],
-            ['Citra 端口池', `${diagnostics.citraPortRange[0]} - ${diagnostics.citraPortRange[1]}（已用 ${diagnostics.usedCitraPorts.length}）`],
-            ['房间端口池', `${diagnostics.roomPortRange[0]} - ${diagnostics.roomPortRange[1]}（已用 ${diagnostics.usedRoomPorts.length}）`],
+            ['本地端口池', `${diagnostics.localPortRange[0]} - ${diagnostics.localPortRange[1]}（已用 ${diagnostics.usedLocalPorts.length}）`],
             ['运行目录', diagnostics.runtimeDir],
             ['采样间隔', `${diagnostics.sampleIntervalMs} ms`],
             ['运行环境', `${diagnostics.platform} · Node ${diagnostics.nodeVersion}`],

@@ -43,6 +43,9 @@ export function createApp({ config, datasource, supervisor, logger, publicDir = 
         try {
             const url = new URL(req.url ?? '/', 'http://internal');
             pathname = url.pathname;
+            // Expose the parsed query string. Handlers read `req.query.lines` etc.;
+            // without this they would silently see undefined and apply defaults.
+            req.query = Object.fromEntries(url.searchParams);
             const matched = router.match(req.method ?? 'GET', pathname);
             if (matched && matched.allowed) {
                 sendJson(res, 405, {

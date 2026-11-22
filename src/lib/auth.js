@@ -125,6 +125,33 @@ export class AuthService {
     }
 
     /**
+     * Create an additional account (owner/admin only, enforced by the route).
+     * Same validation and hashing as first-run setup, minus the one-time gate.
+     */
+    async createAccount({ username, password, role = 'admin' }) {
+        const name = validateUsername(username);
+        if (await this.ds.findUserByUsername(name)) {
+            throw new HttpError(409, '该用户名已存在', { code: 'duplicate_username' });
+        }
+        const strength = checkPasswordStrength(password, {
+            minLength: this.config.auth.passwordMinLength,
+        });
+        if (!strength.ok) {
+            throw new HttpError(400, strength.reason, { code: 'weak_password' });
+        }
+        if (!['admin', 'viewer'].includes(role)) {
+            throw new HttpError(400, '角色只能是 admin 或 viewer', {
+                code: 'invalid_field', details: { field: 'role' },
+            });
+        }
+        const passwordHash = await hashPassword(password);
+        const userId = await this.ds.createUser({ username: name, passwordHash, role });
+        this.logger.info('account created', { username: name, userId, role });
+        const created = await this.ds.findUserById(userId);
+        return created ?? { id: userId, username: name, role };
+    }
+
+    /**
      * Verify credentials and issue a session.
      * Returns { token, csrfToken, expiresAt, user } on success.
      *

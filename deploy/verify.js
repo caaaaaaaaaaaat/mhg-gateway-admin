@@ -87,8 +87,7 @@ process.on('SIGTERM', () => process.exit(0));
             // same verification works on Windows and Linux.
             interpreter: process.execPath,
             binSearchPaths: [binDir],
-            citraPortRange: [27100, 27109],
-            roomPortRange: [26100, 26109],
+            localPortRange: [27100, 27109],
             runtimeDir: join(dataDir, 'rooms'),
             sampleIntervalMs: 500,
             logRetentionDays: 1,
@@ -181,73 +180,91 @@ process.on('SIGTERM', () => process.exit(0));
         });
 
         // --- 6. a write without CSRF is refused ----------------------------
-        const noCsrf = await fetch(`${base}/api/servers`, {
+        const noCsrf = await fetch(`${base}/api/mappings`, {
             method: 'POST',
             headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: 'no-csrf', host: '127.0.0.1', port: 24872 }),
+            body: JSON.stringify({ targetHost: '127.0.0.1', targetPort: 24872 }),
         });
         check(noCsrf.status === 403, '缺少 CSRF 头的写操作被拒绝 (403)', `status=${noCsrf.status}`);
 
-        // --- 7. server + rooms ---------------------------------------------
-        const server = await (await authed('/api/servers', {
+        // --- 7. one row is one pair: local port -> upstream server ---------
+        const pair = await (await authed('/api/mappings', {
             method: 'POST',
-            body: JSON.stringify({ name: '验证服务器', host: '127.0.0.1', port: 24872, password: 'room-pw' }),
+            body: JSON.stringify({
+                name: '验证-1', localPort: 27100,
+                targetHost: '127.0.0.1', targetPort: 24872, password: 'room-pw',
+            }),
         })).json();
-        check(server.data?.id > 0, '创建房间服务器');
-        check(server.data?.hasPassword === true && server.data?.password === undefined, '房间服务器密码不回显');
+        check(pair.data?.id > 0, '创建映射（本地端口 → 目标服务器）', JSON.stringify(pair).slice(0, 160));
+        check(pair.data?.localPort === 27100, '本地端口按填写值保存');
+        check(pair.data?.targetHost === '127.0.0.1' && pair.data?.targetPort === 24872, '目标 host:port 正确保存');
+        check(pair.data?.hasPassword === true && pair.data?.password === undefined, '房间密码不回显');
 
-        const roomIds = [];
-        for (const name of ['验证-1', '验证-2']) {
-            const created = await (await authed('/api/rooms', {
-                method: 'POST',
-                body: JSON.stringify({ name, serverId: server.data.id }),
-            })).json();
-            roomIds.push(created.data.id);
-        }
-        const rooms = await (await authed('/api/rooms')).json();
-        const citraPorts = rooms.data.map((room) => room.citraPort);
-        check(new Set(citraPorts).size === 2, '两个房间分到不同 Citra 端口', JSON.stringify(citraPorts));
+        const auto = await (await authed('/api/mappings', {
+            method: 'POST',
+            body: JSON.stringify({ name: '验证-2', targetHost: '127.0.0.1', targetPort: 24873 }),
+        })).json();
+        check(auto.data?.localPort >= 27101, '留空本地端口时从端口池分配', `got ${auto.data?.localPort}`);
+        const mappingIds = [pair.data.id, auto.data.id];
+        const list = await (await authed('/api/mappings')).json();
+        check(new Set(list.data.map((row) => row.localPort)).size === 2, '两条映射占用不同的本地端口');
+
+        const clash = await authed('/api/mappings', {
+            method: 'POST',
+            body: JSON.stringify({ targetHost: '127.0.0.1', targetPort: 1, localPort: 27100 }),
+        });
+        check(clash.status === 409, '重复本地端口被拒绝 (409)', `status=${clash.status}`);
 
         // --- 8. batch start real processes ---------------------------------
-        const started = await (await authed('/api/rooms/batch/start', {
-            method: 'POST', body: JSON.stringify({ ids: roomIds }),
+        const started = await (await authed('/api/mappings/batch/start', {
+            method: 'POST', body: JSON.stringify({ ids: mappingIds }),
         })).json();
-        check(started.data?.succeeded === 2, '批量启动 2 个房间成功', JSON.stringify(started.data?.results));
+        check(started.data?.succeeded === 2, '批量启动 2 条映射成功', JSON.stringify(started.data?.results));
 
-        const running = await (await authed('/api/rooms')).json();
-        const allRunning = running.data.every((room) => room.state === 'running' && room.pid > 0);
-        check(allRunning, '两个房间均为 running 且有真实 pid');
+        const running = await (await authed('/api/mappings')).json();
+        check(running.data.every((row) => row.state === 'running' && row.pid > 0),
+            '两条映射均为 running 且有真实 pid');
 
         // --- 9. logs -------------------------------------------------------
         await sleep(600);
-        const log = await (await authed(`/api/rooms/${roomIds[0]}/log?lines=50`)).json();
-        check(/gateway listening/.test(log.data?.text ?? ''), '房间日志可读且含网关输出');
-        check(!/room-pw/.test(log.data?.text ?? ''), '日志中不含房间密码');
+        const log = await (await authed(`/api/mappings/${mappingIds[0]}/log?lines=80`)).json();
+        const logText = log.data?.text ?? '';
+        check(/gateway listening/.test(logText), '映射日志可读且含网关输出');
+        check(!/room-pw/.test(logText), '日志中不含房间密码');
+        // The whole point of this model: the gateway must be told to dial the upstream
+        // port the operator typed, not some locally allocated one.
+        check(new RegExp(`--room-port\\s+24872`).test(logText), '网关命令行使用填写的目标端口 24872', logText.slice(0, 200));
+        check(new RegExp(`--listen-port\\s+27100`).test(logText), '网关命令行使用指定的本地端口 27100');
 
         // --- 10. dashboard -------------------------------------------------
         const dashboard = await (await authed('/api/dashboard')).json();
-        check(dashboard.data?.counts?.running === 2, '总览统计显示 2 个运行中');
-        check(dashboard.data?.counts?.total === 2, '总览统计房间总数正确');
+        check(dashboard.data?.counts?.running === 2, '总览统计显示 2 条运行中');
+        check(dashboard.data?.counts?.total === 2, '总览统计映射总数正确');
+        check(Array.isArray(dashboard.data?.localPortRange), '总览接口返回本地端口池');
 
         // --- 11. batch stop ------------------------------------------------
-        const stopped = await (await authed('/api/rooms/batch/stop', {
-            method: 'POST', body: JSON.stringify({ ids: roomIds }),
+        const stopped = await (await authed('/api/mappings/batch/stop', {
+            method: 'POST', body: JSON.stringify({ ids: mappingIds }),
         })).json();
         check(stopped.data?.succeeded === 2, '批量停止成功');
         await sleep(1200);
-        const settled = await (await authed('/api/rooms')).json();
-        check(settled.data.every((room) => room.state === 'stopped' && room.pid === null),
-            '停止后房间状态为 stopped 且无 pid');
+        const settled = await (await authed('/api/mappings')).json();
+        check(settled.data.every((row) => row.state === 'stopped' && row.pid === null),
+            '停止后映射状态为 stopped 且无 pid');
 
         // --- 12. error paths ----------------------------------------------
-        const badRoom = await authed('/api/rooms', {
-            method: 'POST', body: JSON.stringify({ name: '', serverId: server.data.id }),
+        const badPort = await authed('/api/mappings', {
+            method: 'POST', body: JSON.stringify({ targetHost: '127.0.0.1', targetPort: 24872, localPort: 0 }),
         });
-        check(badRoom.status === 400, '空房间名被拒绝 (400)');
-        const badPort = await authed('/api/rooms', {
-            method: 'POST', body: JSON.stringify({ name: '验证-3', serverId: server.data.id, citraPort: 0 }),
+        check(badPort.status === 400, '非法本地端口被拒绝 (400)');
+        const badHost = await authed('/api/mappings', {
+            method: 'POST', body: JSON.stringify({ targetHost: 'http://x/y', targetPort: 24872 }),
         });
-        check(badPort.status === 400, '非法端口被拒绝 (400)');
+        check(badHost.status === 400, '带协议的地址被拒绝 (400)');
+        const mixedHost = await authed('/api/mappings', {
+            method: 'POST', body: JSON.stringify({ targetHost: '1.2.3.4:9901', targetPort: 9901 }),
+        });
+        check(mixedHost.status === 400, 'host 里混填端口被拒绝 (400)');
         const unknownApi = await fetch(`${base}/api/nope`);
         check(unknownApi.status === 404 && (unknownApi.headers.get('content-type') ?? '').includes('json'),
             '未知 API 返回 JSON 404');
@@ -255,8 +272,9 @@ process.on('SIGTERM', () => process.exit(0));
         // --- 13. events ----------------------------------------------------
         const events = await (await authed('/api/events?limit=100')).json();
         const kinds = new Set(events.data.map((event) => event.kind));
-        check(kinds.has('room.started') && kinds.has('room.stopped'), '审计记录包含启动与停止');
+        check(kinds.has('mapping.started') && kinds.has('mapping.stopped'), '审计记录包含启动与停止');
         check(kinds.has('auth.setup'), '审计记录包含初始化');
+        check(kinds.has('mapping.created'), '审计记录包含映射创建');
 
         // --- 14. restart persistence ---------------------------------------
         await stopConsole();
@@ -272,12 +290,18 @@ process.on('SIGTERM', () => process.exit(0));
         check(relogin.ok, '重启后可用同一账户登录');
         const reloginBody = await relogin.json();
         const cookie2 = (relogin.headers.getSetCookie?.() ?? []).map((line) => line.split(';')[0]).join('; ');
-        const rooms2 = await (await fetch(`${base}/api/rooms`, {
+        const mappings2 = await (await fetch(`${base}/api/mappings`, {
             headers: { Cookie: cookie2, 'x-csrf-token': reloginBody.data.csrfToken },
         })).json();
-        check(rooms2.data?.length === 2, '重启后房间仍在');
-        check(rooms2.data.every((room) => room.serverName === '验证服务器'), '重启后房间与服务器关联仍在');
-        check(rooms2.data.every((room) => room.hasPassword === false), '未设置密码的房间密码状态正确');
+        check(mappings2.data?.length === 2, '重启后映射仍在',
+            JSON.stringify(mappings2.data?.map((row) => [row.name, row.localPort, row.targetPort])));
+        check(mappings2.data.every((row) => row.targetHost === '127.0.0.1'), '重启后目标服务器地址仍在',
+            JSON.stringify(mappings2.data?.map((row) => row.targetHost)));
+        check(mappings2.data.some((row) => row.localPort === 27100 && row.targetPort === 24872),
+            '重启后「本地端口 → 目标端口」这一对保持原样');
+        check(mappings2.data.some((row) => row.hasPassword === true) &&
+            mappings2.data.some((row) => row.hasPassword === false), '重启后密码设置状态正确');
+
 
         // --- 15. shutdown leaves no orphan ---------------------------------
         await stopConsole();

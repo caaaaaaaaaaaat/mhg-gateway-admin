@@ -68,8 +68,10 @@ export function defaultConfig() {
             binSearchPaths: ['bin', '/usr/local/bin', '/usr/bin'],
             // Every room is given a Citra listener port and talks to one room
             // server port; both are allocated from these ranges.
-            citraPortRange: [25000, 25999],
-            roomPortRange: [24000, 24999],
+            // The pool of LOCAL ports a mapping may claim. Only this side needs a pool:
+            // the upstream port belongs to the remote room server and is typed per
+            // mapping, never allocated here.
+            localPortRange: [25000, 25999],
             runtimeDir: 'data/rooms',
             // Extra CLI arguments appended to every launch (advanced use only).
             extraArgs: [],
@@ -216,8 +218,7 @@ export function validateConfig(raw, { root = process.cwd() } = {}) {
             binSearchPaths: Array.isArray(gateways.binSearchPaths) && gateways.binSearchPaths.length
                 ? gateways.binSearchPaths.map((entry, index) => abs(requireString(entry, `gateways.binSearchPaths[${index}]`)))
                 : [abs('bin'), '/usr/local/bin', '/usr/bin'],
-            citraPortRange: requirePortRange(gateways.citraPortRange ?? [25000, 25999], 'gateways.citraPortRange'),
-            roomPortRange: requirePortRange(gateways.roomPortRange ?? [24000, 24999], 'gateways.roomPortRange'),
+            localPortRange: requirePortRange(gateways.localPortRange ?? [25000, 25999], 'gateways.localPortRange'),
             runtimeDir: abs(runtimeDir),
             extraArgs: Array.isArray(gateways.extraArgs) ? gateways.extraArgs.map((a, i) => requireString(a, `gateways.extraArgs[${i}]`, { allowEmpty: true })) : [],
             sampleIntervalMs: requireInt(gateways.sampleIntervalMs ?? 2000, 'gateways.sampleIntervalMs', { min: 250, max: 600000 }),

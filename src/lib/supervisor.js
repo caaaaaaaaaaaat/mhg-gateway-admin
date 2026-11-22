@@ -20,7 +20,7 @@ import { createWriteStream, existsSync, mkdirSync, openSync, readSync, closeSync
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 
-export const ROOM_STATE = Object.freeze({
+export const MAPPING_STATE = Object.freeze({
     stopped: 'stopped',
     starting: 'starting',
     running: 'running',
@@ -54,15 +54,27 @@ function nowMs() {
  * opt-in, so a server deployment must state everything explicitly. Kept in one
  * function so a future gateway flag is added in exactly one place.
  */
-export function buildGatewayArgs(room, server, { profile = 'default' } = {}) {
+/**
+ * Build the gateway command line for one mapping.
+ *
+ * The two halves of a mapping map onto the gateway's two address options, and getting
+ * them crossed is the bug this model exists to prevent:
+ *
+ *   --listen / --listen-port   the LOCAL UDP port players connect to  <- mapping.localPort
+ *   --room / --room-port       the UPSTREAM room server's own address <- mapping.targetHost/Port
+ *
+ * `targetPort` is the remote server's port (e.g. 24872, or whatever that server
+ * listens on). It is not a port on this machine.
+ */
+export function buildGatewayArgs(mapping, { profile = mapping.profile ?? 'default' } = {}) {
     const args = [
-        '--listen', room.listenAddress || '0.0.0.0',
-        '--listen-port', String(room.citraPort),
-        '--room', server.host,
-        '--room-port', String(room.roomPort),
-        '--room-capacity', '4',
-        // Room password is forwarded to the room and enforced locally too.
-        '--password', room.password ?? '',
+        '--listen', mapping.listenAddress || mapping.listen_address || '0.0.0.0',
+        '--listen-port', String(mapping.localPort ?? mapping.local_port),
+        '--room', mapping.targetHost ?? mapping.target_host,
+        '--room-port', String(mapping.targetPort ?? mapping.target_port),
+        '--room-capacity', String(mapping.capacity ?? 4),
+        // Room password is enforced locally and forwarded to the room.
+        '--password', mapping.password ?? '',
     ];
     if (profile === 'legacy') {
         // Data-plane relay only: no control plane, no dual-host. Useful as a
@@ -174,8 +186,8 @@ export class GatewaySupervisor extends EventEmitter {
         return this.config.gateways.runtimeDir;
     }
 
-    logPathFor(roomId) {
-        return join(this.runtimeDir, `room-${roomId}.log`);
+    logPathFor(mappingId) {
+        return join(this.runtimeDir, `mapping-${mappingId}.log`);
     }
 
     /** Locate the gateway binary once and remember why it was not found. */
@@ -199,17 +211,17 @@ export class GatewaySupervisor extends EventEmitter {
         // their pid is stale, so they are honestly reported as failed until an
         // operator starts them again. Do not silently relaunch: an operator may
         // have stopped the room on purpose just before the console died.
-        const rooms = await this.ds.listRooms();
+        const rooms = await this.ds.listMappings();
         for (const room of rooms) {
             if (room.desired_state === 'running' && room.state !== 'running') {
-                await this.ds.updateRoom(room.id, {
-                    state: ROOM_STATE.failed,
+                await this.ds.updateMapping(room.id, {
+                    state: MAPPING_STATE.failed,
                     failure: '控制台重启前房间处于运行状态，请重新启动',
                     pid: null,
                 });
             } else if (room.state === 'running') {
-                await this.ds.updateRoom(room.id, {
-                    state: ROOM_STATE.failed,
+                await this.ds.updateMapping(room.id, {
+                    state: MAPPING_STATE.failed,
                     failure: '控制台重启，进程状态未知，请重新启动',
                     pid: null,
                 });
@@ -228,26 +240,26 @@ export class GatewaySupervisor extends EventEmitter {
             clearInterval(this.timer);
             this.timer = null;
         }
-        for (const [roomId, timer] of this.restartTimers) {
+        for (const [mappingId, timer] of this.restartTimers) {
             clearTimeout(timer);
-            this.logger.debug('cancelled pending restart on shutdown', { roomId });
+            this.logger.debug('cancelled pending restart on shutdown', { mappingId });
         }
         this.restartTimers.clear();
         const stops = [];
-        for (const roomId of [...this.procs.keys()]) {
-            stops.push(this.stopRoom(roomId, { reason: 'console-shutdown' }).catch(() => {}));
+        for (const mappingId of [...this.procs.keys()]) {
+            stops.push(this.stopMapping(mappingId, { reason: 'console-shutdown' }).catch(() => {}));
         }
         await Promise.all(stops);
     }
 
-    isRunning(roomId) {
-        const entry = this.procs.get(roomId);
+    isRunning(mappingId) {
+        const entry = this.procs.get(mappingId);
         return Boolean(entry && entry.proc && entry.proc.exitCode === null && !entry.proc.killed);
     }
 
     /** Live pid for a room, or null. */
-    pidOf(roomId) {
-        const entry = this.procs.get(roomId);
+    pidOf(mappingId) {
+        const entry = this.procs.get(mappingId);
         return entry && entry.proc && entry.proc.exitCode === null ? entry.proc.pid ?? null : null;
     }
 
@@ -256,38 +268,45 @@ export class GatewaySupervisor extends EventEmitter {
      * running, and records a failure state instead of throwing for the
      * recoverable cases, because the operator needs to see *why* in the console.
      */
-    async startRoom(roomId, { actor = 'system' } = {}) {
-        const room = await this.ds.findRoomById(roomId);
-        if (!room) throw Object.assign(new Error('房间不存在'), { statusCode: 404 });
-        if (this.isRunning(roomId)) return { ok: true, alreadyRunning: true };
+    async startMapping(mappingId, { actor = 'system' } = {}) {
+        const mapping = await this.ds.findMappingById(mappingId);
+        if (!mapping) throw Object.assign(new Error('映射不存在'), { statusCode: 404 });
+        if (this.isRunning(mappingId)) return { ok: true, alreadyRunning: true };
 
         const binary = this.binary ?? this.probeBinary();
         if (!binary) {
-            await this.ds.updateRoom(roomId, {
-                state: ROOM_STATE.failed,
+            await this.ds.updateMapping(mappingId, {
+                state: MAPPING_STATE.failed,
                 failure: this.binaryError,
                 pid: null,
             });
             await this.ds.addEvent({
-                roomId,
-                kind: 'room.start.refused',
+                mappingId,
+                kind: 'mapping.start.refused',
                 detail: this.binaryError,
                 actor,
             });
             return { ok: false, error: this.binaryError };
         }
 
-        const server = room.server_id ? await this.ds.findServerById(room.server_id) : null;
-        if (!server) {
-            const message = '房间没有绑定可用的房间服务器，请先在“服务器”里配置并选择';
-            await this.ds.updateRoom(roomId, { state: ROOM_STATE.failed, failure: message, pid: null });
-            await this.ds.addEvent({ roomId, kind: 'room.start.refused', detail: message, actor });
+        // A mapping carries both halves of the pair, so there is nothing to look up:
+        // refuse only when the row itself is incomplete.
+        if (!mapping.target_host || !mapping.target_port) {
+            const message = '映射缺少目标服务器地址或端口，请编辑该映射补齐';
+            await this.ds.updateMapping(mappingId, { state: MAPPING_STATE.failed, failure: message, pid: null });
+            await this.ds.addEvent({ mappingId, kind: 'mapping.start.refused', detail: message, actor });
+            return { ok: false, error: message };
+        }
+        if (!mapping.local_port) {
+            const message = '映射缺少本地端口，请编辑该映射补齐';
+            await this.ds.updateMapping(mappingId, { state: MAPPING_STATE.failed, failure: message, pid: null });
+            await this.ds.addEvent({ mappingId, kind: 'mapping.start.refused', detail: message, actor });
             return { ok: false, error: message };
         }
 
         const args = [
-            ...buildGatewayArgs(room, server, { profile: room.profile }),
-            ...(Array.isArray(room.extra_args) ? room.extra_args : []),
+            ...buildGatewayArgs(mapping, { profile: mapping.profile }),
+            ...(Array.isArray(mapping.extra_args) ? mapping.extra_args : []),
             ...this.config.gateways.extraArgs,
         ];
 
@@ -300,13 +319,13 @@ export class GatewaySupervisor extends EventEmitter {
         const command = interpreter.length ? interpreter[0] : binary;
         const argv = interpreter.length ? [...interpreter.slice(1), binary, ...args] : args;
 
-        await this.ds.updateRoom(roomId, {
-            state: ROOM_STATE.starting,
+        await this.ds.updateMapping(mappingId, {
+            state: MAPPING_STATE.starting,
             failure: '',
             desired_state: 'running',
         });
 
-        const logPath = this.logPathFor(roomId);
+        const logPath = this.logPathFor(mappingId);
         this.#rotateLog(logPath);
         let stream;
         try {
@@ -318,11 +337,11 @@ export class GatewaySupervisor extends EventEmitter {
             // A stream error (disk full, permissions) must be handled, otherwise it
             // becomes an unhandled 'error' event and takes the whole console down.
             stream.on('error', (error) => {
-                this.logger.error('room log stream failed', { roomId, path: logPath, error: error.message });
+                this.logger.error('room log stream failed', { mappingId, path: logPath, error: error.message });
             });
         } catch (error) {
             const message = `无法打开房间日志: ${error.message}`;
-            await this.ds.updateRoom(roomId, { state: ROOM_STATE.failed, failure: message, desired_state: 'stopped' });
+            await this.ds.updateMapping(mappingId, { state: MAPPING_STATE.failed, failure: message, desired_state: 'stopped' });
             return { ok: false, error: message };
         }
 
@@ -338,21 +357,21 @@ export class GatewaySupervisor extends EventEmitter {
         } catch (error) {
             stream.end();
             const message = `启动网关失败: ${error.message}`;
-            await this.ds.updateRoom(roomId, {
-                state: ROOM_STATE.failed,
+            await this.ds.updateMapping(mappingId, {
+                state: MAPPING_STATE.failed,
                 failure: message,
                 desired_state: 'stopped',
             });
-            await this.ds.addEvent({ roomId, kind: 'room.start.failed', detail: message, actor });
+            await this.ds.addEvent({ mappingId, kind: 'mapping.start.failed', detail: message, actor });
             return { ok: false, error: message };
         }
 
         const entry = { proc, stream, exitTimer: null };
-        this.procs.set(roomId, entry);
+        this.procs.set(mappingId, entry);
 
         // Never log the password itself: it appears in argv, and the log is served
         // to the browser. Redact it before writing anything.
-        const printable = args.map((value) => (value === room.password && value ? '***' : value));
+        const printable = args.map((value) => (value === mapping.password && value ? '***' : value));
         stream.write(`# ${new Date().toISOString()} start ${binary} ${printable.join(' ')}\n`);
 
         proc.stdout?.on('data', (chunk) => stream.write(chunk));
@@ -368,40 +387,40 @@ export class GatewaySupervisor extends EventEmitter {
 
         proc.on('spawn', async () => {
             try {
-                await this.ds.updateRoom(roomId, {
-                    state: ROOM_STATE.running,
+                await this.ds.updateMapping(mappingId, {
+                    state: MAPPING_STATE.running,
                     pid: proc.pid ?? null,
                     started_at: nowMs(),
                     failure: '',
                 });
                 await this.ds.addEvent({
-                    roomId,
-                    kind: 'room.started',
+                    mappingId,
+                    kind: 'mapping.started',
                     detail: `pid=${proc.pid ?? '?'}`,
                     actor,
                 });
-                this.emit('room', { roomId, state: ROOM_STATE.running });
+                this.emit('room', { mappingId, state: MAPPING_STATE.running });
             } finally {
                 markRunning();
             }
         });
 
         proc.on('error', async (error) => {
-            this.procs.delete(roomId);
+            this.procs.delete(mappingId);
             stream.write(`# spawn error: ${error.message}\n`);
-            await this.ds.updateRoom(roomId, {
-                state: ROOM_STATE.failed,
+            await this.ds.updateMapping(mappingId, {
+                state: MAPPING_STATE.failed,
                 failure: `启动失败: ${error.message}`,
                 pid: null,
                 desired_state: 'stopped',
             });
-            await this.ds.addEvent({ roomId, kind: 'room.spawn.error', detail: error.message, actor });
-            this.emit('room', { roomId, state: ROOM_STATE.failed });
+            await this.ds.addEvent({ mappingId, kind: 'mapping.spawn.error', detail: error.message, actor });
+            this.emit('room', { mappingId, state: MAPPING_STATE.failed });
         });
 
         proc.on('exit', (code, signal) => {
-            this.#onExit(roomId, entry, code, signal).catch((error) => {
-                this.logger.error('exit handling failed', { roomId, error: error.message });
+            this.#onExit(mappingId, entry, code, signal).catch((error) => {
+                this.logger.error('exit handling failed', { mappingId, error: error.message });
             });
         });
 
@@ -442,26 +461,26 @@ export class GatewaySupervisor extends EventEmitter {
         return { ok: true, pid: proc.pid ?? null };
     }
 
-    async #onExit(roomId, entry, code, signal) {
-        this.procs.delete(roomId);
+    async #onExit(mappingId, entry, code, signal) {
+        this.procs.delete(mappingId);
         try {
             entry.stream.end();
         } catch { /* stream already closed */ }
-        const room = await this.ds.findRoomById(roomId);
+        const room = await this.ds.findMappingById(mappingId);
         if (!room) return;
 
         const stoppedByOperator = room.desired_state !== 'running';
         const detail = `退出码=${code ?? 'null'} 信号=${signal ?? 'none'}`;
 
         if (stoppedByOperator) {
-            await this.ds.updateRoom(roomId, {
-                state: ROOM_STATE.stopped,
+            await this.ds.updateMapping(mappingId, {
+                state: MAPPING_STATE.stopped,
                 pid: null,
                 stopped_at: nowMs(),
                 failure: '',
             });
-            await this.ds.addEvent({ roomId, kind: 'room.stopped', detail, actor: 'operator' });
-            this.emit('room', { roomId, state: ROOM_STATE.stopped });
+            await this.ds.addEvent({ mappingId, kind: 'mapping.stopped', detail, actor: 'operator' });
+            this.emit('room', { mappingId, state: MAPPING_STATE.stopped });
             return;
         }
 
@@ -469,75 +488,75 @@ export class GatewaySupervisor extends EventEmitter {
         // The history lives on the supervisor (keyed by room), NOT on `entry`, because
         // every restart builds a fresh entry and would reset the counter forever.
         const now = nowMs();
-        const history = (this.crashTimes.get(roomId) ?? [])
+        const history = (this.crashTimes.get(mappingId) ?? [])
             .filter((t) => now - t < this.restartPolicy.windowMs);
         history.push(now);
-        this.crashTimes.set(roomId, history);
+        this.crashTimes.set(mappingId, history);
 
         if (history.length > this.restartPolicy.maxAttempts) {
-            await this.ds.updateRoom(roomId, {
-                state: ROOM_STATE.failed,
+            await this.ds.updateMapping(mappingId, {
+                state: MAPPING_STATE.failed,
                 pid: null,
                 failure: `短时间内反复退出（${history.length} 次/${Math.round(this.restartPolicy.windowMs / 1000)} 秒），已停止自动重试`,
                 desired_state: 'stopped',
             });
             await this.ds.addEvent({
-                roomId,
-                kind: 'room.crashloop',
+                mappingId,
+                kind: 'mapping.crashloop',
                 detail: `${detail}（熔断，停止自动重启）`,
                 actor: 'system',
             });
-            this.emit('room', { roomId, state: ROOM_STATE.failed });
+            this.emit('room', { mappingId, state: MAPPING_STATE.failed });
             return;
         }
 
-        await this.ds.updateRoom(roomId, {
-            state: ROOM_STATE.failed,
+        await this.ds.updateMapping(mappingId, {
+            state: MAPPING_STATE.failed,
             pid: null,
             failure: `网关进程意外退出（${detail}），正在重启`,
         });
         await this.ds.addEvent({
-            roomId,
-            kind: 'room.crashed',
+            mappingId,
+            kind: 'mapping.crashed',
             detail: `${detail}（第 ${history.length} 次，准备重启）`,
             actor: 'system',
         });
-        this.emit('room', { roomId, state: ROOM_STATE.failed });
+        this.emit('room', { mappingId, state: MAPPING_STATE.failed });
 
         const backoffMs = Math.min(
             this.restartPolicy.maxBackoffMs,
             this.restartPolicy.baseBackoffMs * 2 ** (history.length - 1),
         );
         const restartTimer = setTimeout(() => {
-            this.restartTimers.delete(roomId);
+            this.restartTimers.delete(mappingId);
             // Re-check the operator's intent: a stop arriving during the backoff
             // must win over the crash-recovery schedule.
-            this.ds.findRoomById(roomId).then((current) => {
+            this.ds.findMappingById(mappingId).then((current) => {
                 if (!current || current.desired_state !== 'running') return;
-                return this.startRoom(roomId, { actor: 'system-auto-restart' });
+                return this.startMapping(mappingId, { actor: 'system-auto-restart' });
             }).catch(() => {});
         }, backoffMs);
         restartTimer.unref?.();
-        this.restartTimers.set(roomId, restartTimer);
+        this.restartTimers.set(mappingId, restartTimer);
         entry.exitTimer = restartTimer;
     }
 
     /** Stop one room gracefully: SIGTERM, then SIGKILL after a grace period. */
-    async stopRoom(roomId, { actor = 'operator', reason = '' } = {}) {
-        const room = await this.ds.findRoomById(roomId);
+    async stopMapping(mappingId, { actor = 'operator', reason = '' } = {}) {
+        const room = await this.ds.findMappingById(mappingId);
         if (!room) throw Object.assign(new Error('房间不存在'), { statusCode: 404 });
-        await this.ds.updateRoom(roomId, { desired_state: 'stopped' });
+        await this.ds.updateMapping(mappingId, { desired_state: 'stopped' });
         // Cancel a pending auto-restart first: it is the one thing that could bring
         // the room back after the operator asked for it to stay down.
-        const pendingRestart = this.restartTimers.get(roomId);
+        const pendingRestart = this.restartTimers.get(mappingId);
         if (pendingRestart) {
             clearTimeout(pendingRestart);
-            this.restartTimers.delete(roomId);
+            this.restartTimers.delete(mappingId);
         }
-        const entry = this.procs.get(roomId);
+        const entry = this.procs.get(mappingId);
         if (!entry || entry.proc.exitCode !== null) {
-            await this.ds.updateRoom(roomId, {
-                state: ROOM_STATE.stopped,
+            await this.ds.updateMapping(mappingId, {
+                state: MAPPING_STATE.stopped,
                 pid: null,
                 stopped_at: nowMs(),
                 failure: '',
@@ -548,11 +567,11 @@ export class GatewaySupervisor extends EventEmitter {
             clearTimeout(entry.exitTimer);
             entry.exitTimer = null;
         }
-        this.restartTimers.delete(roomId);
-        await this.ds.updateRoom(roomId, { state: ROOM_STATE.stopping });
+        this.restartTimers.delete(mappingId);
+        await this.ds.updateMapping(mappingId, { state: MAPPING_STATE.stopping });
         await this.ds.addEvent({
-            roomId,
-            kind: 'room.stop.requested',
+            mappingId,
+            kind: 'mapping.stop.requested',
             detail: reason,
             actor,
         });
@@ -576,10 +595,10 @@ export class GatewaySupervisor extends EventEmitter {
     }
 
     /** Wait for a room to leave `starting` and report its settled state. */
-    async waitForState(roomId, predicate, timeoutMs = 5000) {
+    async waitForState(mappingId, predicate, timeoutMs = 5000) {
         const deadline = nowMs() + timeoutMs;
         for (;;) {
-            const room = await this.ds.findRoomById(roomId);
+            const room = await this.ds.findMappingById(mappingId);
             if (room && predicate(room)) return room;
             if (nowMs() >= deadline) return room ?? null;
             await new Promise((resolve) => setTimeout(resolve, 100));
@@ -588,18 +607,18 @@ export class GatewaySupervisor extends EventEmitter {
 
     /** One pass of the sample loop: reconcile live pids with stored state. */
     async sampleAll() {
-        const rooms = await this.ds.listRooms();
+        const rooms = await this.ds.listMappings();
         for (const room of rooms) {
             const live = this.isRunning(room.id);
-            if (room.state === ROOM_STATE.running && !live) {
-                await this.ds.updateRoom(room.id, {
-                    state: ROOM_STATE.failed,
+            if (room.state === MAPPING_STATE.running && !live) {
+                await this.ds.updateMapping(room.id, {
+                    state: MAPPING_STATE.failed,
                     pid: null,
                     failure: room.failure || '进程已不在运行',
                 });
-            } else if (room.state === ROOM_STATE.running && live) {
+            } else if (room.state === MAPPING_STATE.running && live) {
                 const pid = this.pidOf(room.id);
-                if (pid && room.pid !== pid) await this.ds.updateRoom(room.id, { pid });
+                if (pid && room.pid !== pid) await this.ds.updateMapping(room.id, { pid });
             }
         }
         // Housekeeping: expired sessions and old events, once per pass.
@@ -607,8 +626,8 @@ export class GatewaySupervisor extends EventEmitter {
     }
 
     /** Last N lines of a room's log, oldest first. */
-    readLog(roomId, { lines = 200 } = {}) {
-        const text = readTail(this.logPathFor(roomId));
+    readLog(mappingId, { lines = 200 } = {}) {
+        const text = readTail(this.logPathFor(mappingId));
         if (!text) return { text: '', truncated: false };
         const all = text.split(/\r?\n/);
         const wanted = Math.max(1, Math.min(2000, lines));
@@ -627,7 +646,7 @@ export class GatewaySupervisor extends EventEmitter {
             return removed;
         }
         for (const name of entries) {
-            if (!/^room-\d+\.log(\.\d+)?$/.test(name)) continue;
+            if (!/^mapping-\d+\.log(\.\d+)?$/.test(name)) continue;
             const full = join(this.runtimeDir, name);
             try {
                 if (statSync(full).mtimeMs < cutoff) {

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { GatewaySupervisor, buildGatewayArgs, allocatePort, resolveGatewayBinary, ROOM_STATE } from '../src/lib/supervisor.js';
+import { GatewaySupervisor, buildGatewayArgs, allocatePort, resolveGatewayBinary, MAPPING_STATE } from '../src/lib/supervisor.js';
 import { SqliteDatasource } from '../src/datasource/sqlite.js';
 import { validateConfig, defaultConfig } from '../src/lib/config.js';
 import { createLogger } from '../src/lib/logger.js';
@@ -28,8 +28,8 @@ async function makeHarness({ stubArgs = [], supervisorOverrides = {}, restartPol
         gateways: {
             binaryPath: binary,
             binSearchPaths: ['bin'],
-            citraPortRange: [27000, 27010],
-            roomPortRange: [26000, 26010],
+            localPortRange: [27000, 27010],
+            
             runtimeDir: 'rooms',
             extraArgs: stubArgs,
             sampleIntervalMs: 60_000,
@@ -50,12 +50,12 @@ async function makeHarness({ stubArgs = [], supervisorOverrides = {}, restartPol
         ...supervisorOverrides,
     });
     supervisor.probeBinary();
-    const serverId = await ds.createServer({ name: 'sup-server', host: '127.0.0.1', port: 24872 });
-    const roomId = await ds.createRoom({
-        name: 'sup-room',
-        serverId,
-        citraPort: 27000,
-        roomPort: 26000,
+    // One mapping is one pair, so there is no server row to create first.
+    const roomId = await ds.createMapping({
+        name: 'sup-map',
+        localPort: 27000,
+        targetHost: '127.0.0.1',
+        targetPort: 24872,
         listenAddress: '0.0.0.0',
         password: 'room-secret',
         profile: 'default',
@@ -66,7 +66,6 @@ async function makeHarness({ stubArgs = [], supervisorOverrides = {}, restartPol
         ds,
         supervisor,
         roomId,
-        serverId,
         async close() {
             await supervisor.stop();
             await ds.close();
@@ -87,14 +86,20 @@ async function waitFor(predicate, { timeoutMs = 8000, intervalMs = 50 } = {}) {
     }
 }
 
-test('buildGatewayArgs states the loopback and dual-host options explicitly', () => {
-    const room = { listenAddress: '0.0.0.0', citraPort: 25000, roomPort: 24000, password: 'pw', profile: 'default' };
-    const server = { host: '10.0.0.9', port: 24872 };
-    const args = buildGatewayArgs(room, server, { profile: 'default' });
+test('buildGatewayArgs maps the pair onto the right gateway addresses', () => {
+    // The whole point of the model: localPort is what players dial, and
+    // targetHost:targetPort is the upstream room server. Crossing them is the bug
+    // this test exists to catch.
+    const mapping = {
+        listenAddress: '0.0.0.0', localPort: 25000,
+        targetHost: 'www.example.com', targetPort: 9901,
+        password: 'pw', profile: 'default', capacity: 4,
+    };
+    const args = buildGatewayArgs(mapping, { profile: 'default' });
 
     assert.deepEqual(args.slice(0, 10), [
-        '--listen', '0.0.0.0', '--listen-port', '25000', '--room', '10.0.0.9',
-        '--room-port', '24000', '--room-capacity', '4',
+        '--listen', '0.0.0.0', '--listen-port', '25000', '--room', 'www.example.com',
+        '--room-port', '9901', '--room-capacity', '4',
     ]);
     assert.ok(args.includes('--password'));
     assert.equal(args[args.indexOf('--password') + 1], 'pw');
@@ -104,14 +109,14 @@ test('buildGatewayArgs states the loopback and dual-host options explicitly', ()
     assert.equal(args[args.indexOf('--ldn-comm-id') + 1], '0100770008dd8000');
     assert.equal(args[args.indexOf('--uds-profile') + 1], 'mhxx');
 
-    const legacy = buildGatewayArgs(room, server, { profile: 'legacy' });
+    const legacy = buildGatewayArgs(mapping, { profile: 'legacy' });
     assert.equal(legacy.includes('--control-plane'), false, 'legacy is data-plane only');
     assert.equal(legacy.includes('--ldn-dual-host'), false);
     assert.equal(legacy[legacy.indexOf('--listen') + 1], '0.0.0.0');
 
     // An empty password is still forwarded explicitly: the gateway treats a missing
     // --password and an empty one differently in its own local check.
-    const noPassword = buildGatewayArgs({ ...room, password: '' }, server, { profile: 'default' });
+    const noPassword = buildGatewayArgs({ ...mapping, password: '' }, { profile: 'default' });
     assert.equal(noPassword[noPassword.indexOf('--password') + 1], '');
 });
 
@@ -143,37 +148,37 @@ test('resolveGatewayBinary prefers the explicit path and reports nothing when ab
     }
 });
 
-test('a room refused to start when the binary is missing records why', async () => {
+test('a mapping refused to start when the binary is missing records why', async () => {
     const h = await makeHarness();
     try {
         h.supervisor.binary = null;
         h.supervisor.binaryError = '';
         h.config.gateways.binaryPath = '';
         h.config.gateways.binSearchPaths = ['/nonexistent-path-for-test'];
-        const result = await h.supervisor.startRoom(h.roomId, { actor: 'tester' });
+        const result = await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
         assert.equal(result.ok, false);
         assert.match(result.error, /找不到 citra-gateway/);
-        const room = await h.ds.findRoomById(h.roomId);
-        assert.equal(room.state, ROOM_STATE.failed);
+        const room = await h.ds.findMappingById(h.roomId);
+        assert.equal(room.state, MAPPING_STATE.failed);
         assert.match(room.failure, /找不到 citra-gateway/);
         const events = await h.ds.listEvents({ roomId: h.roomId, limit: 10 });
-        assert.ok(events.some((event) => event.kind === 'room.start.refused'));
+        assert.ok(events.some((event) => event.kind === 'mapping.start.refused'));
     } finally {
         await h.close();
     }
 });
 
-test('start moves the room to running, stop returns it to stopped', async () => {
+test('start moves the mapping to running, stop returns it to stopped', async () => {
     const h = await makeHarness();
     try {
-        const started = await h.supervisor.startRoom(h.roomId, { actor: 'tester' });
+        const started = await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
         assert.equal(started.ok, true);
         assert.ok(started.pid > 0, 'a real pid is reported');
         assert.equal(h.supervisor.isRunning(h.roomId), true);
         assert.equal(h.supervisor.pidOf(h.roomId), started.pid);
 
-        const room = await h.ds.findRoomById(h.roomId);
-        assert.equal(room.state, ROOM_STATE.running);
+        const room = await h.ds.findMappingById(h.roomId);
+        assert.equal(room.state, MAPPING_STATE.running);
         assert.equal(room.desired_state, 'running');
         assert.equal(Number(room.pid), started.pid);
         assert.ok(room.started_at > 0);
@@ -191,15 +196,15 @@ test('start moves the room to running, stop returns it to stopped', async () => 
         assert.match(text, /\*\*\*/, 'the redaction is visible in the log');
 
         // Starting twice is idempotent rather than an error.
-        const again = await h.supervisor.startRoom(h.roomId);
+        const again = await h.supervisor.startMapping(h.roomId);
         assert.equal(again.ok, true);
         assert.equal(again.alreadyRunning, true);
 
-        const stopped = await h.supervisor.stopRoom(h.roomId, { actor: 'tester' });
+        const stopped = await h.supervisor.stopMapping(h.roomId, { actor: 'tester' });
         assert.equal(stopped.ok, true);
         const after = await waitFor(async () => {
-            const current = await h.ds.findRoomById(h.roomId);
-            return current.state === ROOM_STATE.stopped ? current : null;
+            const current = await h.ds.findMappingById(h.roomId);
+            return current.state === MAPPING_STATE.stopped ? current : null;
         });
         assert.ok(after, 'the room settles in stopped');
         assert.equal(after.desired_state, 'stopped');
@@ -208,15 +213,15 @@ test('start moves the room to running, stop returns it to stopped', async () => 
 
         const events = await h.ds.listEvents({ roomId: h.roomId, limit: 20 });
         const kinds = events.map((event) => event.kind);
-        assert.ok(kinds.includes('room.started'));
-        assert.ok(kinds.includes('room.stop.requested'));
-        assert.ok(kinds.includes('room.stopped'));
+        assert.ok(kinds.includes('mapping.started'));
+        assert.ok(kinds.includes('mapping.stop.requested'));
+        assert.ok(kinds.includes('mapping.stopped'));
     } finally {
         await h.close();
     }
 });
 
-test('a crash restarts the room with backoff and is recorded', async () => {
+test('a crash restarts the mapping with backoff and is recorded', async () => {
     // --stub-exit exits immediately with code 3, which is the crash path.
     // A compressed backoff keeps the fuse observable without a minute of waiting.
     const h = await makeHarness({
@@ -224,13 +229,13 @@ test('a crash restarts the room with backoff and is recorded', async () => {
         restartPolicy: { maxAttempts: 3, windowMs: 60_000, baseBackoffMs: 60, maxBackoffMs: 200 },
     });
     try {
-        const started = await h.supervisor.startRoom(h.roomId, { actor: 'tester' });
+        const started = await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
         assert.equal(started.ok, true);
 
         // The first crash must be recorded before the restart attempt.
         const crashed = await waitFor(async () => {
             const events = await h.ds.listEvents({ roomId: h.roomId, limit: 50 });
-            return events.find((event) => event.kind === 'room.crashed') ?? null;
+            return events.find((event) => event.kind === 'mapping.crashed') ?? null;
         });
         assert.ok(crashed, 'a crash produces a room.crashed event');
         assert.match(crashed.detail, /退出码=3/);
@@ -238,17 +243,17 @@ test('a crash restarts the room with backoff and is recorded', async () => {
         // And the restart loop must give up at the fuse rather than spin forever.
         const loop = await waitFor(async () => {
             const events = await h.ds.listEvents({ roomId: h.roomId, limit: 160 });
-            return events.find((event) => event.kind === 'room.crashloop') ?? null;
+            return events.find((event) => event.kind === 'mapping.crashloop') ?? null;
         }, { timeoutMs: 30_000, intervalMs: 100 });
         assert.ok(loop, 'the crash-loop fuse eventually trips');
-        const room = await h.ds.findRoomById(h.roomId);
-        assert.equal(room.state, ROOM_STATE.failed);
+        const room = await h.ds.findMappingById(h.roomId);
+        assert.equal(room.state, MAPPING_STATE.failed);
         assert.equal(room.desired_state, 'stopped', 'the fuse stops automatic restarts');
         assert.match(room.failure, /反复退出/);
 
         // Every attempt is auditable: one crashed event per try plus the fuse.
         const all = await h.ds.listEvents({ roomId: h.roomId, limit: 200 });
-        const crashes = all.filter((event) => event.kind === 'room.crashed').length;
+        const crashes = all.filter((event) => event.kind === 'mapping.crashed').length;
         assert.ok(crashes >= 2, `expected repeated crash attempts, saw ${crashes}`);
     } finally {
         await h.close();
@@ -258,7 +263,7 @@ test('a crash restarts the room with backoff and is recorded', async () => {
 test('the log viewer returns the tail and marks truncation', async () => {
     const h = await makeHarness({ stubArgs: ['--stub-echo'] });
     try {
-        await h.supervisor.startRoom(h.roomId, { actor: 'tester' });
+        await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
         await waitFor(async () => {
             const logPath = h.supervisor.logPathFor(h.roomId);
             if (!existsSync(logPath)) return null;
@@ -287,10 +292,10 @@ test('log rotation keeps a bounded number of files', async () => {
         const { mkdirSync } = await import('node:fs');
         mkdirSync(h.config.gateways.runtimeDir, { recursive: true });
         writeFileSync(logPath, 'x'.repeat(3 * 1024 * 1024));
-        await h.supervisor.startRoom(h.roomId, { actor: 'tester' });
+        await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
         assert.ok(existsSync(`${logPath}.1`), 'the oversized log is rotated to .1');
         assert.ok(statSync(logPath).size < 3 * 1024 * 1024, 'the new log starts small');
-        await h.supervisor.stopRoom(h.roomId);
+        await h.supervisor.stopMapping(h.roomId);
     } finally {
         await h.close();
     }
@@ -302,8 +307,8 @@ test('pruneLogs removes logs past the retention window and nothing else', async 
         const { mkdirSync, utimesSync } = await import('node:fs');
         const dir = h.config.gateways.runtimeDir;
         mkdirSync(dir, { recursive: true });
-        const oldLog = join(dir, 'room-1.log');
-        const newLog = join(dir, 'room-2.log');
+        const oldLog = join(dir, 'mapping-1.log');
+        const newLog = join(dir, 'mapping-2.log');
         const unrelated = join(dir, 'notes.txt');
         writeFileSync(oldLog, 'old');
         writeFileSync(newLog, 'new');
@@ -312,7 +317,7 @@ test('pruneLogs removes logs past the retention window and nothing else', async 
         utimesSync(oldLog, ancient, ancient);
 
         const removed = h.supervisor.pruneLogs();
-        assert.ok(removed.some((path) => path.endsWith('room-1.log')), 'the old log is removed');
+        assert.ok(removed.some((path) => path.endsWith('mapping-1.log')), 'the old log is removed');
         assert.ok(existsSync(newLog), 'a fresh log survives');
         assert.ok(existsSync(unrelated), 'an unrelated file in the runtime dir is untouched');
     } finally {
@@ -323,10 +328,10 @@ test('pruneLogs removes logs past the retention window and nothing else', async 
 test('stale running state is reported as failed on startup, not silently relaunched', async () => {
     const h = await makeHarness();
     try {
-        await h.ds.updateRoom(h.roomId, { state: 'running', desired_state: 'running', pid: 999999 });
+        await h.ds.updateMapping(h.roomId, { state: 'running', desired_state: 'running', pid: 999999 });
         await h.supervisor.start();
-        const room = await h.ds.findRoomById(h.roomId);
-        assert.equal(room.state, ROOM_STATE.failed);
+        const room = await h.ds.findMappingById(h.roomId);
+        assert.equal(room.state, MAPPING_STATE.failed);
         assert.equal(room.pid, null);
         assert.match(room.failure, /请重新启动/);
         assert.equal(h.supervisor.isRunning(h.roomId), false, 'nothing was launched behind the operator');
@@ -338,11 +343,11 @@ test('stale running state is reported as failed on startup, not silently relaunc
 test('sampleAll reconciles a live pid and clears expired sessions', async () => {
     const h = await makeHarness();
     try {
-        await h.supervisor.startRoom(h.roomId, { actor: 'tester' });
+        await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
         // Corrupt the stored pid: the sample loop must correct it from the process.
-        await h.ds.updateRoom(h.roomId, { pid: 1 });
+        await h.ds.updateMapping(h.roomId, { pid: 1 });
         await h.supervisor.sampleAll();
-        const room = await h.ds.findRoomById(h.roomId);
+        const room = await h.ds.findMappingById(h.roomId);
         assert.equal(room.pid, h.supervisor.pidOf(h.roomId));
 
         await h.ds.createSession({
@@ -350,20 +355,20 @@ test('sampleAll reconciles a live pid and clears expired sessions', async () => 
             expiresAt: Date.now() - 1000, userAgent: '', remoteAddr: '',
         }).catch(() => { /* user 1 may not exist: irrelevant to pruning */ });
         await h.supervisor.sampleAll();
-        await h.supervisor.stopRoom(h.roomId);
+        await h.supervisor.stopMapping(h.roomId);
     } finally {
         await h.close();
     }
 });
 
-test('stopping an already stopped room is a no-op success', async () => {
+test('stopping an already stopped mapping is a no-op success', async () => {
     const h = await makeHarness();
     try {
-        const result = await h.supervisor.stopRoom(h.roomId, { actor: 'tester' });
+        const result = await h.supervisor.stopMapping(h.roomId, { actor: 'tester' });
         assert.equal(result.ok, true);
         assert.equal(result.alreadyStopped, true);
-        const room = await h.ds.findRoomById(h.roomId);
-        assert.equal(room.state, ROOM_STATE.stopped);
+        const room = await h.ds.findMappingById(h.roomId);
+        assert.equal(room.state, MAPPING_STATE.stopped);
     } finally {
         await h.close();
     }
@@ -375,19 +380,19 @@ test('stop interrupts a scheduled auto-restart', async () => {
         restartPolicy: { maxAttempts: 5, windowMs: 60_000, baseBackoffMs: 400, maxBackoffMs: 400 },
     });
     try {
-        await h.supervisor.startRoom(h.roomId, { actor: 'tester' });
+        await h.supervisor.startMapping(h.roomId, { actor: 'tester' });
         // Wait for the first crash so a restart is pending.
         await waitFor(async () => {
             const events = await h.ds.listEvents({ roomId: h.roomId, limit: 20 });
-            return events.some((event) => event.kind === 'room.crashed');
+            return events.some((event) => event.kind === 'mapping.crashed');
         });
-        await h.supervisor.stopRoom(h.roomId, { actor: 'tester' });
-        const room = await h.ds.findRoomById(h.roomId);
+        await h.supervisor.stopMapping(h.roomId, { actor: 'tester' });
+        const room = await h.ds.findMappingById(h.roomId);
         assert.equal(room.desired_state, 'stopped');
         // Give the pending timer time to fire if it were still armed.
         await sleep(1500);
-        const after = await h.ds.findRoomById(h.roomId);
-        assert.equal(after.state, ROOM_STATE.stopped, 'no restart happened after an operator stop');
+        const after = await h.ds.findMappingById(h.roomId);
+        assert.equal(after.state, MAPPING_STATE.stopped, 'no restart happened after an operator stop');
         assert.equal(h.supervisor.isRunning(h.roomId), false);
     } finally {
         await h.close();

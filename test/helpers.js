@@ -48,8 +48,8 @@ export function testConfig(overrides = {}) {
         gateways: {
             binaryPath: '',
             binSearchPaths: ['bin'],
-            citraPortRange: [26000, 26010],
-            roomPortRange: [25000, 25010],
+            // Only the LOCAL side has a pool; the upstream port is typed per mapping.
+            localPortRange: [26000, 26010],
             runtimeDir: 'rooms',
             extraArgs: [],
             sampleIntervalMs: 60_000,
@@ -146,13 +146,24 @@ export async function startTestApp({ config = testConfig(), spawnImpl = stubSpaw
             client.session = signIn.body.data;
             return client.session;
         },
-        /** Create a server row directly through the API. */
-        async createServer(overrides = {}) {
-            const response = await request('/api/servers', {
+        /**
+         * Create a mapping through the real API: one local port paired with one
+         * upstream room server. Ports are left blank by default so the pool assigns
+         * a distinct one per call.
+         */
+        async createMapping(overrides = {}) {
+            const response = await request('/api/mappings', {
                 method: 'POST',
-                body: { name: `srv-${Math.random().toString(36).slice(2, 8)}`, host: '127.0.0.1', port: 24872, ...overrides },
+                body: {
+                    name: `map-${Math.random().toString(36).slice(2, 8)}`,
+                    targetHost: '127.0.0.1',
+                    targetPort: 24872,
+                    ...overrides,
+                },
             });
-            if (response.status !== 201) throw new Error(`createServer failed: ${response.status} ${JSON.stringify(response.body)}`);
+            if (response.status !== 201) {
+                throw new Error(`createMapping failed: ${response.status} ${JSON.stringify(response.body)}`);
+            }
             return response.body.data;
         },
     };

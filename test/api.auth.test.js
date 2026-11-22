@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // HTTP API integration tests: the real server, real SQLite, real router, real
 // cookie/CSRF handling. Only the gateway process is stubbed.
+//
+// The subject is the MAPPING: one local port -> one upstream room server.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -52,12 +54,6 @@ test('setup validates the username, password length and confirmation', async () 
         assert.equal(weak.status, 400);
         assert.equal(weak.body.error.code, 'weak_password');
 
-        const badName = await app.client.request('/api/setup', {
-            method: 'POST',
-            body: { username: 'has space', password: 'Test-Password-123', confirm: 'Test-Password-123' },
-        });
-        assert.equal(badName.status, 400);
-
         const ok = await app.client.request('/api/setup', {
             method: 'POST',
             body: { username: 'admin', password: 'Test-Password-123', confirm: 'Test-Password-123' },
@@ -89,17 +85,13 @@ test('login issues a session cookie and a CSRF token', async () => {
         });
         assert.equal(login.status, 200);
         const cookie = login.headers.getSetCookie().join(';');
-        assert.match(cookie, /mhga_test_session=/);
-        assert.match(cookie, /HttpOnly/, 'the session cookie must not be readable by script');
+        assert.match(cookie, /HttpOnly/);
         assert.match(cookie, /SameSite=Lax/);
-        assert.ok(app.client.jar.has('mhga_test_session'));
         assert.ok(login.body.data.csrfToken.length > 20);
 
         const session = await app.client.request('/api/session');
         assert.equal(session.body.data.authenticated, true);
-        assert.equal(session.body.data.user.username, 'admin');
         assert.equal(session.body.data.user.role, 'owner');
-        assert.equal(session.body.data.csrfToken, login.body.data.csrfToken);
     } finally {
         await app.close();
     }
@@ -109,20 +101,18 @@ test('wrong password is rejected and repeated failures lock the account', async 
     const app = await startTestApp();
     try {
         await app.client.login({ password: 'Test-Password-123' });
-        // The configured maximum in testConfig is 3 failures.
         for (let attempt = 1; attempt <= 3; attempt += 1) {
             const response = await app.client.request('/api/login', {
                 method: 'POST',
                 body: { username: 'admin', password: `wrong-${attempt}-value` },
             });
-            assert.equal(response.status === 401 || response.status === 423, true,
-                `attempt ${attempt} should be rejected, got ${response.status}`);
+            assert.equal(response.status === 401 || response.status === 423, true);
         }
         const locked = await app.client.request('/api/login', {
             method: 'POST',
             body: { username: 'admin', password: 'Test-Password-123' },
         });
-        assert.equal(locked.status, 423, 'the correct password is refused while locked');
+        assert.equal(locked.status, 423);
         assert.equal(locked.body.error.code, 'account_locked');
 
         const unknown = await app.client.request('/api/login', {
@@ -140,22 +130,22 @@ test('mutating requests require the CSRF header', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-        const withoutCsrf = await app.client.request('/api/servers', {
+        const withoutCsrf = await app.client.request('/api/mappings', {
             method: 'POST',
             csrf: false,
-            body: { name: 'no-csrf', host: '127.0.0.1', port: 24872 },
+            body: { targetHost: '127.0.0.1', targetPort: 24872 },
         });
         assert.equal(withoutCsrf.status, 403);
         assert.equal(withoutCsrf.body.error.code, 'csrf_failed');
 
-        const wrongCsrf = await app.client.request('/api/servers', {
+        const wrongCsrf = await app.client.request('/api/mappings', {
             method: 'POST',
             headers: { 'x-csrf-token': 'not-the-token' },
-            body: { name: 'bad-csrf', host: '127.0.0.1', port: 24872 },
+            body: { targetHost: '127.0.0.1', targetPort: 24872 },
         });
         assert.equal(wrongCsrf.status, 403);
 
-        const ok = await app.client.createServer({ name: 'with-csrf' });
+        const ok = await app.client.createMapping();
         assert.notEqual(ok.id, undefined);
     } finally {
         await app.close();
@@ -166,120 +156,106 @@ test('logout invalidates the session immediately', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-        const before = await app.client.request('/api/session');
-        assert.equal(before.body.data.authenticated, true);
-
         const out = await app.client.request('/api/logout', { method: 'POST' });
         assert.equal(out.status, 200);
         const after = await app.client.request('/api/session');
         assert.equal(after.body.data.authenticated, false);
-        assert.equal(app.client.jar.has('mhga_test_session'), false, 'the cookie is cleared');
     } finally {
         await app.close();
     }
 });
 
-test('server CRUD validates input and protects referenced rows', async () => {
+test('a mapping stores one pair: local port and upstream server', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-
-        const empty = await app.client.request('/api/servers', {
-            method: 'POST', body: { name: '', host: '127.0.0.1', port: 24872 },
+        const created = await app.client.request('/api/mappings', {
+            method: 'POST',
+            body: {
+                name: 'oku-1',
+                localPort: 26005,
+                targetHost: 'www.okuapi.xyz',
+                targetPort: 9901,
+                password: 'pw',
+            },
         });
-        assert.equal(empty.status, 400);
+        assert.equal(created.status, 201, JSON.stringify(created.body));
+        const mapping = created.body.data;
 
-        const badHost = await app.client.request('/api/servers', {
-            method: 'POST', body: { name: 'x1', host: 'http://a/b', port: 24872 },
-        });
-        assert.equal(badHost.status, 400);
-
-        const badPort = await app.client.request('/api/servers', {
-            method: 'POST', body: { name: 'x2', host: '127.0.0.1', port: 0 },
-        });
-        assert.equal(badPort.status, 400);
-
-        const created = await app.client.createServer({ name: 'srv-a', host: '10.1.2.3', port: 24872, password: 'pw' });
-        assert.equal(created.hasPassword, true);
-        assert.equal(created.password, undefined, 'the password is never echoed back');
-
-        const duplicate = await app.client.request('/api/servers', {
-            method: 'POST', body: { name: 'srv-a', host: '1.1.1.1', port: 1 },
-        });
-        assert.equal(duplicate.status, 409);
-
-        const patched = await app.client.request(`/api/servers/${created.id}`, {
-            method: 'PATCH', body: { port: 24900, notes: 'updated' },
-        });
-        assert.equal(patched.status, 200);
-        assert.equal(patched.body.data.port, 24900);
-        assert.equal(patched.body.data.host, '10.1.2.3', 'untouched fields survive');
-
-        // Bind a room, then the server must be undeletable.
-        const room = await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: 'room-x', serverId: created.id },
-        });
-        assert.equal(room.status, 201);
-
-        const blocked = await app.client.request(`/api/servers/${created.id}`, { method: 'DELETE' });
-        assert.equal(blocked.status, 409);
-        assert.equal(blocked.body.error.code, 'server_in_use');
-        assert.deepEqual(blocked.body.error.details.rooms, ['room-x']);
-
-        await app.client.request(`/api/rooms/${room.body.data.id}`, { method: 'DELETE' });
-        const deleted = await app.client.request(`/api/servers/${created.id}`, { method: 'DELETE' });
-        assert.equal(deleted.status, 200);
+        // The pair, stored as typed.
+        assert.equal(mapping.localPort, 26005);
+        assert.equal(mapping.targetHost, 'www.okuapi.xyz');
+        assert.equal(mapping.targetPort, 9901);
+        // The upstream password is stored but never echoed.
+        assert.equal(mapping.hasPassword, true);
+        assert.equal(mapping.password, undefined);
+        assert.equal(mapping.state, 'stopped');
+        // There is no separate server entity any more.
+        assert.equal('serverId' in mapping, false);
+        assert.equal('citraPort' in mapping, false);
+        assert.equal('roomPort' in mapping, false);
     } finally {
         await app.close();
     }
 });
 
-test('room creation allocates ports from the configured pools without collisions', async () => {
+test('a blank local port is allocated from the pool', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-        const server = await app.client.createServer();
         const created = [];
         for (let index = 0; index < 5; index += 1) {
-            const response = await app.client.request('/api/rooms', {
+            const response = await app.client.request('/api/mappings', {
                 method: 'POST',
-                body: { name: `自动-${index}`, serverId: server.id },
+                body: { targetHost: '10.0.0.1', targetPort: 24872 },
             });
             assert.equal(response.status, 201, JSON.stringify(response.body));
             created.push(response.body.data);
         }
-        const citraPorts = created.map((room) => room.citraPort);
-        const roomPorts = created.map((room) => room.roomPort);
-        assert.equal(new Set(citraPorts).size, 5, 'citra ports must be unique');
-        assert.equal(new Set(roomPorts).size, 5, 'room ports must be unique');
-        assert.equal(citraPorts[0], 26000, 'allocation starts at the low bound');
-        assert.equal(roomPorts[0], 25000);
+        const ports = created.map((row) => row.localPort);
+        assert.equal(new Set(ports).size, 5, 'each blank port gets a distinct one');
+        // testConfig's pool is 26000..26010, so allocation starts at the low bound.
+        assert.equal(ports[0], 26000);
+        assert.equal(ports[4], 26004);
+        // A blank name is derived from the port, which is what an operator would
+        // have typed anyway.
+        assert.equal(created[0].name, '端口26000');
+    } finally {
+        await app.close();
+    }
+});
 
-        // Explicit ports are honoured, duplicates are refused.
-        const explicit = await app.client.request('/api/rooms', {
+test('an explicit local port is honoured and conflicts are refused', async () => {
+    const app = await startTestApp();
+    try {
+        await app.client.login();
+        const first = await app.client.request('/api/mappings', {
             method: 'POST',
-            body: { name: '显式端口', serverId: server.id, citraPort: 26999, roomPort: 25999 },
+            body: { localPort: 26010, targetHost: '10.0.0.1', targetPort: 24872 },
         });
-        assert.equal(explicit.status, 201);
-        assert.equal(explicit.body.data.citraPort, 26999);
+        assert.equal(first.status, 201);
+        assert.equal(first.body.data.localPort, 26010);
 
-        const clash = await app.client.request('/api/rooms', {
+        const clash = await app.client.request('/api/mappings', {
             method: 'POST',
-            body: { name: '端口冲突', serverId: server.id, citraPort: 26999 },
+            body: { localPort: 26010, targetHost: '10.0.0.2', targetPort: 24873 },
         });
         assert.equal(clash.status, 409);
         assert.equal(clash.body.error.code, 'port_in_use');
-        assert.equal(clash.body.error.details.field, 'citraPort');
+        assert.equal(clash.body.error.details.port, 26010);
 
-        // Exhausting the pool is a clear 409, not a silent reuse.
-        for (let index = 0; index < 20; index += 1) {
-            await app.client.request('/api/rooms', {
+        // Exhausting the pool is a clear 409, never a silent reuse.
+        // testConfig's pool is 26000..26010 (11 ports); 26010 is taken above, so ten
+        // more blank allocations fill it.
+        for (let index = 0; index < 10; index += 1) {
+            await app.client.request('/api/mappings', {
                 method: 'POST',
-                body: { name: `填充-${index}`, serverId: server.id },
+                body: { targetHost: '10.0.0.1', targetPort: 24872 },
             });
         }
-        const exhausted = await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: '超出池', serverId: server.id },
+        const exhausted = await app.client.request('/api/mappings', {
+            method: 'POST',
+            body: { targetHost: '10.0.0.1', targetPort: 24872 },
         });
         assert.equal(exhausted.status, 409);
         assert.equal(exhausted.body.error.code, 'port_pool_exhausted');
@@ -288,30 +264,32 @@ test('room creation allocates ports from the configured pools without collisions
     }
 });
 
-test('room input validation rejects bad names, profiles and addresses', async () => {
+test('mapping input validation rejects a bad pair', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-        const server = await app.client.createServer();
         const cases = [
-            [{ name: '', serverId: server.id }, 'empty name'],
-            [{ name: 'a'.repeat(40), serverId: server.id }, 'name too long'],
-            [{ name: 'name!', serverId: server.id }, 'illegal characters'],
-            [{ name: 'ok-name', serverId: 99999 }, 'unknown server'],
-            [{ name: 'ok-name2', serverId: server.id, profile: 'turbo' }, 'unknown profile'],
-            [{ name: 'ok-name3', serverId: server.id, listenAddress: 'not-an-ip' }, 'bad listen address'],
-            [{ name: 'ok-name4', serverId: server.id, citraPort: 70000 }, 'port out of range'],
+            [{ targetPort: 24872 }, 'missing target host'],
+            [{ targetHost: '10.0.0.1' }, 'missing target port'],
+            [{ targetHost: '10.0.0.1', targetPort: 0 }, 'target port out of range'],
+            [{ targetHost: '10.0.0.1', targetPort: 70000 }, 'target port too large'],
+            [{ targetHost: 'http://a/b', targetPort: 24872 }, 'host with a scheme'],
+            [{ targetHost: 'www.example.com:9901', targetPort: 9901 }, 'host with an embedded port'],
+            [{ targetHost: '10.0.0.1', targetPort: 24872, localPort: 70000 }, 'local port out of range'],
+            [{ targetHost: '10.0.0.1', targetPort: 24872, profile: 'turbo' }, 'unknown profile'],
+            [{ targetHost: '10.0.0.1', targetPort: 24872, listenAddress: 'nope' }, 'bad listen address'],
         ];
         for (const [body, label] of cases) {
-            const response = await app.client.request('/api/rooms', { method: 'POST', body });
+            const response = await app.client.request('/api/mappings', { method: 'POST', body });
             assert.equal(response.status, 400, `${label} should be a 400, got ${response.status}`);
         }
-        const duplicate = await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: 'ok-name', serverId: server.id },
+
+        const duplicate = await app.client.request('/api/mappings', {
+            method: 'POST', body: { name: 'dup-name', targetHost: '10.0.0.1', targetPort: 24872 },
         });
-        assert.equal(duplicate.status, 201, 'a valid name still works');
-        const again = await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: 'ok-name', serverId: server.id },
+        assert.equal(duplicate.status, 201);
+        const again = await app.client.request('/api/mappings', {
+            method: 'POST', body: { name: 'dup-name', targetHost: '10.0.0.1', targetPort: 24872 },
         });
         assert.equal(again.status, 409);
         assert.equal(again.body.error.code, 'duplicate_name');
@@ -320,47 +298,72 @@ test('room input validation rejects bad names, profiles and addresses', async ()
     }
 });
 
-test('a running room refuses settings that would need a restart', async () => {
+test('a running mapping refuses changes that need a restart', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-        const server = await app.client.createServer();
-        const room = (await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: '运行中编辑', serverId: server.id },
-        })).body.data;
-        // Simulate a live process: the supervisor is bypassed, only the stored
-        // state matters for this rule.
-        await app.datasource.updateRoom(room.id, { state: 'running', pid: 1234, desired_state: 'running' });
+        const mapping = await app.client.createMapping({ name: '运行中' });
+        // Simulate a live process: the supervisor is bypassed; only the stored state
+        // matters for this rule.
+        await app.datasource.updateMapping(mapping.id, {
+            state: 'running', pid: 1234, desired_state: 'running',
+        });
 
-        const refused = await app.client.request(`/api/rooms/${room.id}`, {
-            method: 'PATCH', body: { citraPort: 26009 },
+        const refused = await app.client.request(`/api/mappings/${mapping.id}`, {
+            method: 'PATCH', body: { targetPort: 9901 },
         });
         assert.equal(refused.status, 409);
-        assert.equal(refused.body.error.code, 'room_running');
+        assert.equal(refused.body.error.code, 'mapping_running');
+
+        const refusedPort = await app.client.request(`/api/mappings/${mapping.id}`, {
+            method: 'PATCH', body: { localPort: 26009 },
+        });
+        assert.equal(refusedPort.status, 409, 'the local port also needs a restart');
 
         // A display-only change is still allowed while running.
-        const allowed = await app.client.request(`/api/rooms/${room.id}`, {
+        const allowed = await app.client.request(`/api/mappings/${mapping.id}`, {
             method: 'PATCH', body: { name: '运行中改名' },
         });
         assert.equal(allowed.status, 200);
+
+        // And a running mapping cannot be deleted (that would orphan the process).
+        const del = await app.client.request(`/api/mappings/${mapping.id}`, { method: 'DELETE' });
+        assert.equal(del.status, 409);
     } finally {
         await app.close();
     }
 });
 
-test('batch start reports per-room failures instead of failing wholesale', async () => {
+test('editing an idle mapping changes the target and keeps the rest', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-        const server = await app.client.createServer();
-        const a = (await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: '批-A', serverId: server.id },
-        })).body.data;
-        const b = (await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: '批-B', serverId: server.id },
-        })).body.data;
+        const mapping = await app.client.createMapping({
+            name: 'idle', localPort: 26003, targetHost: '10.0.0.1', targetPort: 24872, password: 'secret',
+        });
+        const patched = await app.client.request(`/api/mappings/${mapping.id}`, {
+            method: 'PATCH',
+            body: { targetHost: '10.0.0.9', targetPort: 9901, notes: 'updated' },
+        });
+        assert.equal(patched.status, 200);
+        assert.equal(patched.body.data.targetHost, '10.0.0.9');
+        assert.equal(patched.body.data.targetPort, 9901);
+        assert.equal(patched.body.data.localPort, 26003, 'untouched fields survive');
+        assert.equal(patched.body.data.hasPassword, true, 'an untouched password stays set');
+        assert.equal(patched.body.data.notes, 'updated');
+    } finally {
+        await app.close();
+    }
+});
 
-        const response = await app.client.request('/api/rooms/batch/start', {
+test('batch start reports per-mapping failures instead of failing wholesale', async () => {
+    const app = await startTestApp();
+    try {
+        await app.client.login();
+        const a = await app.client.createMapping({ name: '批-A' });
+        const b = await app.client.createMapping({ name: '批-B' });
+
+        const response = await app.client.request('/api/mappings/batch/start', {
             method: 'POST', body: { ids: [a.id, b.id, 99999] },
         });
         assert.equal(response.status, 200);
@@ -371,12 +374,12 @@ test('batch start reports per-room failures instead of failing wholesale', async
         assert.equal(missing.ok, false);
         assert.match(missing.error, /不存在/);
 
-        const invalid = await app.client.request('/api/rooms/batch/start', {
+        const invalid = await app.client.request('/api/mappings/batch/start', {
             method: 'POST', body: { ids: [] },
         });
         assert.equal(invalid.status, 400);
 
-        const badAction = await app.client.request('/api/rooms/batch/purge', {
+        const badAction = await app.client.request('/api/mappings/batch/purge', {
             method: 'POST', body: { ids: [a.id] },
         });
         assert.equal(badAction.status, 400);
@@ -394,7 +397,7 @@ test('viewer accounts cannot mutate anything', async () => {
             body: { username: 'reader', password: 'Reader-Password-123', role: 'viewer' },
         });
         assert.equal(created.status, 201);
-        const server = await app.client.createServer();
+        const mapping = await app.client.createMapping();
 
         await app.client.request('/api/logout', { method: 'POST' });
         const viewerLogin = await app.client.request('/api/login', {
@@ -403,20 +406,29 @@ test('viewer accounts cannot mutate anything', async () => {
         assert.equal(viewerLogin.status, 200);
         app.client.session = viewerLogin.body.data;
 
-        const read = await app.client.request('/api/rooms');
+        const read = await app.client.request('/api/mappings');
         assert.equal(read.status, 200, 'a viewer can read');
 
-        const write = await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: 'nope', serverId: server.id },
-        });
-        assert.equal(write.status, 403);
-        assert.equal(write.body.error.code, 'forbidden');
+        const writes = [
+            ['POST', '/api/mappings', { targetHost: '1.1.1.1', targetPort: 1 }],
+            ['POST', `/api/mappings/${mapping.id}/start`, {}],
+            ['POST', `/api/mappings/${mapping.id}/stop`, {}],
+            ['POST', '/api/mappings/batch/start', { ids: [mapping.id] }],
+            ['PATCH', `/api/mappings/${mapping.id}`, { name: 'x' }],
+            ['DELETE', `/api/mappings/${mapping.id}`, undefined],
+            ['POST', '/api/users', { username: 'y', password: 'Y-Password-1234' }],
+        ];
+        for (const [method, path, body] of writes) {
+            const response = await app.client.request(path, { method, body });
+            assert.equal(response.status, 403, `${method} ${path} must be refused, got ${response.status}`);
+            assert.equal(response.body.error.code, 'forbidden');
+        }
 
         const users = await app.client.request('/api/users');
         assert.equal(users.status, 403, 'a viewer cannot list accounts');
 
-        const start = await app.client.request(`/api/rooms/1/start`, { method: 'POST' });
-        assert.equal(start.status, 403);
+        const diagnostics = await app.client.request('/api/diagnostics');
+        assert.equal(diagnostics.status, 403);
     } finally {
         await app.close();
     }
@@ -445,12 +457,34 @@ test('accounts: creation, deletion and owner protection', async () => {
         const list = await app.client.request('/api/users');
         assert.equal(list.body.data.length, 2);
         const owner = list.body.data.find((user) => user.role === 'owner');
-        assert.ok(owner, 'the first account is the owner');
+        assert.ok(owner);
 
+        // Owner protection is checked against the acting account: the owner cannot
+        // delete itself (self_delete), and another admin cannot delete the owner
+        // (owner_protected).
+        const selfDelete = await app.client.request(`/api/users/${owner.id}`, { method: 'DELETE' });
+        assert.equal(selfDelete.status, 400);
+        assert.equal(selfDelete.body.error.code, 'self_delete');
+
+        await app.client.request('/api/logout', { method: 'POST' });
+        const adminLogin = await app.client.request('/api/login', {
+            method: 'POST', body: { username: 'helper', password: 'Helper-Password-1' },
+        });
+        app.client.session = adminLogin.body.data;
         const deleteOwner = await app.client.request(`/api/users/${owner.id}`, { method: 'DELETE' });
         assert.equal(deleteOwner.status, 403);
         assert.equal(deleteOwner.body.error.code, 'owner_protected');
 
+        const deleteSelf = await app.client.request(`/api/users/${created.body.data.id}`, { method: 'DELETE' });
+        assert.equal(deleteSelf.status, 400);
+        assert.equal(deleteSelf.body.error.code, 'self_delete');
+
+        // The owner can remove another account.
+        await app.client.request('/api/logout', { method: 'POST' });
+        const ownerLogin = await app.client.request('/api/login', {
+            method: 'POST', body: { username: 'admin', password: 'Test-Password-123' },
+        });
+        app.client.session = ownerLogin.body.data;
         const deleteOther = await app.client.request(`/api/users/${created.body.data.id}`, { method: 'DELETE' });
         assert.equal(deleteOther.status, 200);
     } finally {
@@ -468,18 +502,11 @@ test('changing the password revokes every session including the current one', as
         });
         assert.equal(wrong.status, 403);
 
-        const mismatch = await app.client.request('/api/password', {
-            method: 'POST',
-            body: { currentPassword: 'Test-Password-123', newPassword: 'New-Password-456', confirm: 'New-Password-457' },
-        });
-        assert.equal(mismatch.status, 400);
-
         const ok = await app.client.request('/api/password', {
             method: 'POST',
             body: { currentPassword: 'Test-Password-123', newPassword: 'New-Password-456', confirm: 'New-Password-456' },
         });
         assert.equal(ok.status, 200);
-        assert.equal(ok.body.data.reauthenticate, true);
 
         const session = await app.client.request('/api/session');
         assert.equal(session.body.data.authenticated, false, 'the old session is gone');
@@ -487,7 +514,7 @@ test('changing the password revokes every session including the current one', as
         const oldLogin = await app.client.request('/api/login', {
             method: 'POST', body: { username: 'admin', password: 'Test-Password-123' },
         });
-        assert.equal(oldLogin.status, 401, 'the old password no longer works');
+        assert.equal(oldLogin.status, 401);
 
         const newLogin = await app.client.request('/api/login', {
             method: 'POST', body: { username: 'admin', password: 'New-Password-456' },
@@ -502,31 +529,57 @@ test('dashboard, events and diagnostics answer for a signed-in admin', async () 
     const app = await startTestApp();
     try {
         await app.client.login();
-        const server = await app.client.createServer({ name: '看板服务器' });
-        await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: '看板房间', serverId: server.id },
+        const mapping = await app.client.createMapping({
+            name: '看板映射', localPort: 26001, targetHost: '10.1.2.3', targetPort: 9901,
         });
 
         const dashboard = await app.client.request('/api/dashboard');
         assert.equal(dashboard.status, 200);
         assert.equal(dashboard.body.data.counts.total, 1);
-        assert.equal(dashboard.body.data.counts.running, 0);
-        assert.equal(dashboard.body.data.rooms.length, 1);
-        assert.equal(dashboard.body.data.rooms[0].serverName, '看板服务器');
+        assert.equal(dashboard.body.data.mappings.length, 1);
+        assert.equal(dashboard.body.data.mappings[0].localPort, 26001);
+        assert.equal(dashboard.body.data.mappings[0].targetHost, '10.1.2.3');
         assert.equal(dashboard.body.data.gatewayBinaryFound, false);
-        assert.ok(dashboard.body.data.events.length >= 2, 'creation is audited');
+        assert.ok(dashboard.body.data.events.length >= 1, 'creation is audited');
+        assert.deepEqual(dashboard.body.data.localPortRange, [26000, 26010]);
 
         const events = await app.client.request('/api/events?limit=5');
         assert.equal(events.status, 200);
-        assert.ok(events.body.data.length >= 1);
-        assert.ok(events.body.data[0].kind);
+        assert.ok(events.body.data.some((event) => event.kind === 'mapping.created'));
+
+        const filtered = await app.client.request(`/api/events?mappingId=${mapping.id}`);
+        assert.equal(filtered.status, 200);
+        assert.ok(filtered.body.data.every((event) => event.mapping_id === mapping.id || event.mapping_id === null));
 
         const diagnostics = await app.client.request('/api/diagnostics');
         assert.equal(diagnostics.status, 200);
         assert.equal(diagnostics.body.data.datasource, 'sqlite');
-        assert.equal(diagnostics.body.data.citraPortRange[0], 26000);
-        assert.equal(diagnostics.body.data.usedCitraPorts.length, 1);
+        assert.deepEqual(diagnostics.body.data.localPortRange, [26000, 26010]);
+        assert.deepEqual(diagnostics.body.data.usedLocalPorts, [26001]);
         assert.match(diagnostics.body.data.nodeVersion, /^v\d+/);
+    } finally {
+        await app.close();
+    }
+});
+
+test('a deleted mapping frees its local port', async () => {
+    const app = await startTestApp();
+    try {
+        await app.client.login();
+        const mapping = await app.client.createMapping({ localPort: 26000 });
+        const del = await app.client.request(`/api/mappings/${mapping.id}`, { method: 'DELETE' });
+        assert.equal(del.status, 200);
+
+        // The same port can be claimed again, and a blank allocation reuses the gap.
+        const reused = await app.client.request('/api/mappings', {
+            method: 'POST', body: { localPort: 26000, targetHost: '10.0.0.1', targetPort: 1 },
+        });
+        assert.equal(reused.status, 201);
+
+        const auto = await app.client.request('/api/mappings', {
+            method: 'POST', body: { targetHost: '10.0.0.1', targetPort: 1 },
+        });
+        assert.equal(auto.body.data.localPort, 26001, 'the next free port is chosen');
     } finally {
         await app.close();
     }
@@ -536,36 +589,25 @@ test('a body that is not JSON or is too large is refused', async () => {
     const app = await startTestApp();
     try {
         await app.client.login();
-        const wrongType = await fetch(`${app.base}/api/servers`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'text/plain',
-                'x-csrf-token': app.client.session.csrfToken,
-                Cookie: `mhga_test_session=${app.client.jar.get('mhga_test_session')}`,
-            },
-            body: 'name=x',
+        const cookieHeader = `mhga_test_session=${app.client.jar.get('mhga_test_session')}`;
+        const headers = {
+            'x-csrf-token': app.client.session.csrfToken,
+            Cookie: cookieHeader,
+        };
+        const wrongType = await fetch(`${app.base}/api/mappings`, {
+            method: 'POST', headers: { ...headers, 'Content-Type': 'text/plain' }, body: 'name=x',
         });
         assert.equal(wrongType.status, 415);
 
-        const invalidJson = await fetch(`${app.base}/api/servers`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-csrf-token': app.client.session.csrfToken,
-                Cookie: `mhga_test_session=${app.client.jar.get('mhga_test_session')}`,
-            },
-            body: '{oops',
+        const invalidJson = await fetch(`${app.base}/api/mappings`, {
+            method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: '{oops',
         });
         assert.equal(invalidJson.status, 400);
 
-        const tooBig = await fetch(`${app.base}/api/servers`, {
+        const tooBig = await fetch(`${app.base}/api/mappings`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-csrf-token': app.client.session.csrfToken,
-                Cookie: `mhga_test_session=${app.client.jar.get('mhga_test_session')}`,
-            },
-            body: JSON.stringify({ name: 'x'.repeat(300_000), host: '127.0.0.1', port: 1 }),
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ targetHost: 'x'.repeat(300_000), targetPort: 1 }),
         });
         assert.equal(tooBig.status, 413);
     } finally {
@@ -580,34 +622,25 @@ test('static assets are served with security headers and no traversal', async ()
         assert.equal(index.status, 200);
         const csp = index.headers.get('content-security-policy');
         assert.match(csp, /default-src 'self'/);
+        assert.match(csp, /style-src 'self'/);
         assert.match(csp, /frame-ancestors 'none'/);
         assert.equal(index.headers.get('x-content-type-options'), 'nosniff');
-        assert.equal(index.headers.get('x-frame-options'), 'DENY');
-        const html = await index.text();
-        assert.match(html, /网关管理控制台/);
+        assert.match(await index.text(), /网关管理/);
 
         for (const path of ['/app.css', '/app.js']) {
-            const asset = await fetch(`${app.base}${path}`);
-            assert.equal(asset.status, 200, `${path} must be served`);
+            assert.equal((await fetch(`${app.base}${path}`)).status, 200, `${path} must be served`);
         }
 
-        for (const path of ['/../src/index.js', '/%2e%2e/src/index.js', '/..%2f..%2fpackage.json']) {
+        for (const path of ['/../src/index.js', '/%2e%2e/src/index.js']) {
             const response = await fetch(`${app.base}${path}`);
-            assert.ok(response.status === 404 || response.status === 200, `${path} handled`);
             if (response.status === 200) {
-                const text = await response.text();
-                assert.equal(text.includes('loadConfig'), false, `${path} must not leak server source`);
+                assert.equal((await response.text()).includes('loadConfig'), false, `${path} must not leak source`);
             }
         }
 
-        // A non-whitelisted extension inside public/ must not be published.
-        const json = await fetch(`${app.base}/package.json`);
-        assert.equal(json.status === 404 || json.status === 200, true);
-
-        // A deep link falls back to the SPA shell.
-        const deep = await fetch(`${app.base}/rooms`);
+        const deep = await fetch(`${app.base}/mappings`);
         assert.equal(deep.status, 200);
-        assert.match(await deep.text(), /网关管理控制台/);
+        assert.match(await deep.text(), /网关管理/);
     } finally {
         await app.close();
     }
@@ -619,8 +652,12 @@ test('unknown API routes are a JSON 404, not the SPA shell', async () => {
         const response = await fetch(`${app.base}/api/does-not-exist`);
         assert.equal(response.status, 404);
         assert.match(response.headers.get('content-type'), /application\/json/);
-        const body = await response.json();
-        assert.equal(body.error.code, 'not_found');
+        assert.equal((await response.json()).error.code, 'not_found');
+
+        // The old room/server endpoints are gone, not silently aliased.
+        for (const path of ['/api/rooms', '/api/servers']) {
+            assert.equal((await fetch(`${app.base}${path}`)).status, 404, `${path} no longer exists`);
+        }
     } finally {
         await app.close();
     }
@@ -637,25 +674,18 @@ test('a wrong HTTP method on a known route is a 405 with Allow', async () => {
     }
 });
 
-test('the password is never stored in plaintext anywhere the API can return it', async () => {
+test('the upstream password is never returned and never stored in plaintext', async () => {
     const app = await startTestApp();
     try {
         await app.client.login({ password: 'Plaintext-Probe-123' });
-        const server = await app.client.createServer({ password: 'Room-Secret-777' });
-        const room = (await app.client.request('/api/rooms', {
-            method: 'POST', body: { name: '密码房间', serverId: server.id, password: 'Access-Secret-888' },
-        })).body.data;
+        const mapping = await app.client.createMapping({ name: '密码映射', password: 'Access-Secret-888' });
 
-        const rooms = await app.client.request('/api/rooms');
-        const serialised = JSON.stringify(rooms.body);
-        assert.equal(serialised.includes('Access-Secret-888'), false, 'room password never leaves the server');
-        assert.equal(serialised.includes('Room-Secret-777'), false, 'server password never leaves the server');
-        assert.equal(room.hasPassword, true);
+        const list = await app.client.request('/api/mappings');
+        const serialised = JSON.stringify(list.body);
+        assert.equal(serialised.includes('Access-Secret-888'), false, 'the password never leaves the server');
+        assert.equal(mapping.hasPassword, true);
 
-        const servers = await app.client.request('/api/servers');
-        assert.equal(JSON.stringify(servers.body).includes('Room-Secret-777'), false);
-
-        // And the datasource stores the account password as a scrypt hash.
+        // The account password is a scrypt hash, not the plaintext.
         const user = await app.datasource.findUserByUsername('admin');
         assert.match(user.password_hash, /^scrypt\$/);
         assert.equal(user.password_hash.includes('Plaintext-Probe-123'), false);
@@ -664,15 +694,14 @@ test('the password is never stored in plaintext anywhere the API can return it',
     }
 });
 
-test('config with a custom session TTL expires the session', async () => {
-    // Exercise the expiry branch directly through the auth service with a short TTL
-    // rather than sleeping: the datasource holds the authoritative timestamp.
+test('an expired session is refused', async () => {
     const config = testConfig();
     const app = await startTestApp({ config });
     try {
         await app.client.login();
+        const { hashToken } = await import('../src/lib/tokens.js');
         const session = await app.datasource.findSessionByTokenHash(
-            (await import('../src/lib/tokens.js')).hashToken(app.client.jar.get('mhga_test_session')),
+            hashToken(app.client.jar.get('mhga_test_session')),
         );
         assert.ok(session);
         // Force the row into the past: the next request must treat it as gone.

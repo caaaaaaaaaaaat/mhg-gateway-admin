@@ -14,7 +14,7 @@
 //   * Methods are async even when the implementation is synchronous, so a
 //     network-backed driver is a drop-in replacement.
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * Users: the console's administrators.
@@ -46,26 +46,26 @@ export const USERS_TABLE = 'users';
 export const SESSIONS_TABLE = 'sessions';
 
 /**
- * Servers: the upstream Yuzu/LDN room servers a gateway can join.
- *   id          integer primary key
- *   name        text unique friendly label
- *   host        text IPv4 literal or hostname
- *   port        integer 1..65535
- *   password    text room password (empty means none)
- *   notes       text
- *   created_at / updated_at integer ms
- */
-export const SERVERS_TABLE = 'servers';
-
-/**
- * Rooms: one managed gateway process per row.
+ * Mappings: the console's whole subject matter. One row is ONE pair:
+ *
+ *     a local UDP port that players connect to  ->  one upstream room server
+ *
+ * That is the entire model. A row owns one gateway process; the gateway listens on
+ * `local_port` for Citra clients and forwards the room traffic to
+ * `target_host:target_port`, which is the Yuzu/room server's own address and port
+ * (NOT a port on this machine). Version 1 of this schema split that pair into a
+ * `servers` row plus a `rooms` row and derived the upstream port from a local pool,
+ * which pointed the gateway at the wrong port; the pair is now one row precisely so
+ * the two halves cannot drift apart.
+ *
  *   id             integer primary key
- *   name           text unique
- *   server_id      integer -> servers.id
- *   citra_port     integer
- *   room_port      integer
- *   listen_address text
- *   password       text Citra-side room password
+ *   name           text unique friendly label, e.g. 'oku-1'
+ *   local_port     integer unique 1..65535 -- the port players connect to
+ *   target_host    text upstream room server host or IPv4 literal
+ *   target_port    integer 1..65535 -- the upstream server's OWN port
+ *   password       text upstream room password ('' means no password)
+ *   listen_address text local bind address for the gateway
+ *   capacity       integer known member slots (0 = unknown)
  *   profile        text 'default' | 'dual-host' | 'legacy'
  *   desired_state  text 'running' | 'stopped'
  *   state          text 'stopped' | 'starting' | 'running' | 'stopping' | 'failed'
@@ -73,15 +73,38 @@ export const SERVERS_TABLE = 'servers';
  *   failure        text
  *   started_at     integer ms | null
  *   stopped_at     integer ms | null
- *   extra_args     text JSON array
+ *   extra_args     text JSON array of extra gateway arguments
+ *   notes          text
  *   created_at / updated_at integer ms
  */
-export const ROOMS_TABLE = 'rooms';
+export const MAPPINGS_TABLE = 'mappings';
 
 /**
- * Room events: an append-only audit trail per room and for the console itself.
+ * Columns a caller may write on a mapping, and the camelCase aliases the route
+ * layer uses. Shared by both SQL drivers so a field can never be writable through
+ * one driver and silently ignored by the other.
+ */
+export const MAPPING_COLUMNS = Object.freeze([
+    'name', 'local_port', 'target_host', 'target_port', 'password', 'listen_address',
+    'capacity', 'profile', 'desired_state', 'state', 'pid', 'failure',
+    'started_at', 'stopped_at', 'extra_args', 'notes',
+]);
+
+export const MAPPING_ALIASES = Object.freeze({
+    localPort: 'local_port',
+    targetHost: 'target_host',
+    targetPort: 'target_port',
+    listenAddress: 'listen_address',
+    desiredState: 'desired_state',
+    startedAt: 'started_at',
+    stoppedAt: 'stopped_at',
+    extraArgs: 'extra_args',
+});
+
+/**
+ * Audit trail: append-only, for both mappings and console-level events.
  *   id         integer primary key
- *   room_id    integer | null
+ *   mapping_id integer | null -> mappings.id (null for console events)
  *   at         integer ms
  *   kind       text
  *   detail     text
@@ -138,24 +161,34 @@ export class Datasource {
     async deleteSessionsForUser(userId) { throw new Error('not implemented'); }
     async pruneExpiredSessions(now) { throw new Error('not implemented'); }
 
-    // ---- servers ----------------------------------------------------------
-    async listServers() { throw new Error('not implemented'); }
-    async findServerById(id) { throw new Error('not implemented'); }
-    async createServer({ name, host, port, password, notes }) { throw new Error('not implemented'); }
-    async updateServer(id, fields) { throw new Error('not implemented'); }
-    async deleteServer(id) { throw new Error('not implemented'); }
-
-    // ---- rooms ------------------------------------------------------------
-    async listRooms() { throw new Error('not implemented'); }
-    async findRoomById(id) { throw new Error('not implemented'); }
-    async findRoomByName(name) { throw new Error('not implemented'); }
-    async createRoom(room) { throw new Error('not implemented'); }
-    async updateRoom(id, fields) { throw new Error('not implemented'); }
-    async deleteRoom(id) { throw new Error('not implemented'); }
-    async listUsedPorts() { throw new Error('not implemented'); }
+    // ---- mappings ---------------------------------------------------------
+    /** All mappings, newest first. */
+    async listMappings() { throw new Error('not implemented'); }
+    /** One mapping, or null. */
+    async findMappingById(id) { throw new Error('not implemented'); }
+    /** One mapping by friendly name (used for the unique-name check), or null. */
+    async findMappingByName(name) { throw new Error('not implemented'); }
+    /**
+     * Create a mapping. Every field of MAPPINGS_TABLE except id/timestamps may be
+     * supplied; the driver fills sensible defaults for the process-state columns.
+     * @returns {Promise<number>} the new mapping id
+     */
+    async createMapping(mapping) { throw new Error('not implemented'); }
+    /** Partial update by id. Returns the number of rows changed. */
+    async updateMapping(id, fields) { throw new Error('not implemented'); }
+    /** Delete by id. Returns the number of rows removed. */
+    async deleteMapping(id) { throw new Error('not implemented'); }
+    /**
+     * Local ports currently claimed by any mapping. The console uses this to pick a
+     * free port when the operator leaves the field blank, and to refuse a duplicate.
+     * @returns {Promise<number[]>}
+     */
+    async listUsedLocalPorts() { throw new Error('not implemented'); }
 
     // ---- events -----------------------------------------------------------
-    async addEvent({ roomId, at, kind, detail, actor }) { throw new Error('not implemented'); }
-    async listEvents({ roomId, limit }) { throw new Error('not implemented'); }
+    /** `mappingId` is optional; omit it for console-level events. */
+    async addEvent({ mappingId, at, kind, detail, actor }) { throw new Error('not implemented'); }
+    /** Newest first. `mappingId` filters to one mapping when given. */
+    async listEvents({ mappingId, limit }) { throw new Error('not implemented'); }
     async pruneEvents(olderThanMs) { throw new Error('not implemented'); }
 }

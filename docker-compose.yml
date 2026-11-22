@@ -12,7 +12,7 @@
 #     they must be published to be reachable by players. The default pools are
 #     25000-25999 (Citra side) and 24000-24999 (room side). Publishing 1000 ports
 #     each is wasteful, so this file publishes a small window; widen it to match
-#     your actual room count, and keep it in sync with citraPortRange/roomPortRange.
+#     your actual room count, and keep it in sync with gateways.localPortRange.
 #
 # Note on UDP and Docker: each gateway room listens on its own UDP port. Docker's
 # userland proxy handles many short UDP ranges fine, but for tens of rooms make

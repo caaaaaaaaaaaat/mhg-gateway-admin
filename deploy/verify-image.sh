@@ -7,7 +7,7 @@
 # exists and exercises the things that actually decide whether a deployment is
 # usable: the full business flow over HTTP, and -- the part that matters most for
 # a volume-backed console -- that deleting the container and recreating it from
-# the same volume keeps accounts, rooms and audit history.
+# the same volume keeps accounts, mappings and audit history.
 #
 # It is written to be safe on a shared server:
 #   * every container it creates is named with a unique prefix and removed after;
@@ -131,30 +131,37 @@ CSRF="$(json_field "$LOGIN" csrfToken)"
 ck "$([ -n "$CSRF" ] && echo 1 || echo 0)" "登录并取得 CSRF token"
 grep -qi 'httponly' "$JAR" 2>/dev/null && ck 1 "会话 cookie 含 HttpOnly" || note "cookie 文件中未见 HttpOnly 标记"
 
-CODE="$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE/api/servers" \
-    -H 'Content-Type: application/json' -d '{"name":"nocsrf","host":"127.0.0.1","port":24872}')"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE/api/mappings" \
+    -H 'Content-Type: application/json' -d '{"targetHost":"127.0.0.1","targetPort":24872}')"
 ck "$([ "$CODE" = "403" ] && echo 1 || echo 0)" "无 CSRF 头的写操作被拒绝 (403)"
 
-say "房间管理"
-SRV="$(curl -s -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
-    -X POST "$BASE/api/servers" \
-    -d '{"name":"验证服务器","host":"127.0.0.1","port":24872,"password":"room-pw"}')"
-SRVID="$(json_number "$SRV" id)"
-ck "$([ -n "$SRVID" ] && echo 1 || echo 0)" "创建房间服务器"
-printf '%s' "$SRV" | grep -q 'room-pw' && ck 0 "服务器密码未回显" || ck 1 "服务器密码未回显"
+say "端口映射"
+# One row is one pair: a local port and the upstream server it forwards to.
+M1="$(curl -s -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+    -X POST "$BASE/api/mappings" \
+    -d '{"name":"验证-1","localPort":25000,"targetHost":"www.okuapi.xyz","targetPort":9901,"password":"room-pw"}')"
+MID="$(json_number "$M1" id)"
+ck "$([ -n "$MID" ] && echo 1 || echo 0)" "创建映射（本地端口 → 目标服务器）"
+printf '%s' "$M1" | grep -q '"localPort":25000' && ck 1 "本地端口按填写值保存" || ck 0 "本地端口按填写值保存"
+printf '%s' "$M1" | grep -q '"targetHost":"www.okuapi.xyz"' && ck 1 "目标服务器地址保存" || ck 0 "目标服务器地址保存"
+printf '%s' "$M1" | grep -q '"targetPort":9901' && ck 1 "目标服务器端口保存" || ck 0 "目标服务器端口保存"
+printf '%s' "$M1" | grep -q 'room-pw' && ck 0 "房间密码未回显" || ck 1 "房间密码未回显"
 
-for n in 验证-1 验证-2; do
-    curl -s -o /dev/null -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
-        -X POST "$BASE/api/rooms" -d "{\"name\":\"$n\",\"serverId\":$SRVID}"
-done
-ROOMS="$(curl -s -b "$JAR" "$BASE/api/rooms")"
-NROOMS="$(printf '%s' "$ROOMS" | grep -o '"id":' | wc -l | tr -d ' ')"
-ck "$([ "$NROOMS" = "2" ] && echo 1 || echo 0)" "创建 2 个房间"
-printf '%s' "$ROOMS" | grep -q '"citraPort":25000' && ck 1 "端口从池低位开始分配" || note "端口分配: $(printf '%s' "$ROOMS" | grep -o '"citraPort":[0-9]*' | head -2 | tr '\n' ' ')"
+# A blank local port is allocated from the pool.
+curl -s -o /dev/null -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+    -X POST "$BASE/api/mappings" -d '{"name":"验证-2","targetHost":"127.0.0.1","targetPort":24872}'
+MAPS="$(curl -s -b "$JAR" "$BASE/api/mappings")"
+NMAPS="$(printf '%s' "$MAPS" | grep -o '"id":' | wc -l | tr -d ' ')"
+ck "$([ "$NMAPS" = "2" ] && echo 1 || echo 0)" "创建 2 条映射"
+printf '%s' "$MAPS" | grep -q '"localPort":25001' && ck 1 "留空端口从池中分配 (25001)" || note "自动端口: $(printf '%s' "$MAPS" | grep -o '"localPort":[0-9]*' | tr '\n' ' ')"
 
-RID="$(json_number "$ROOMS" id)"
+# A duplicate local port is refused with a precise error.
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H "x-csrf-token: $CSRF" -H 'Content-Type: application/json' \
+    -X POST "$BASE/api/mappings" -d '{"targetHost":"127.0.0.1","targetPort":1,"localPort":25000}')"
+ck "$([ "$CODE" = "409" ] && echo 1 || echo 0)" "重复本地端口被拒绝 (409)"
+
 CODE="$(curl -s -b "$JAR" -H "x-csrf-token: $CSRF" -o "$DATA/.start.json" -w '%{http_code}' \
-    -X POST "$BASE/api/rooms/$RID/start")"
+    -X POST "$BASE/api/mappings/$MID/start")"
 # Without a Linux gateway binary inside the image, Start must refuse honestly.
 ck "$([ "$CODE" = "409" ] && echo 1 || echo 0)" "无网关二进制时启动如实拒绝 (409)"
 grep -q 'citra-gateway' "$DATA/.start.json" 2>/dev/null && ck 1 "拒绝原因指向 citra-gateway" || note "拒绝信息: $(head -c 200 "$DATA/.start.json" 2>/dev/null)"
@@ -202,12 +209,14 @@ LOGIN2="$(curl -s -c "$JAR2" -X POST "$BASE/api/login" \
 CSRF2="$(json_field "$LOGIN2" csrfToken)"
 ck "$([ -n "$CSRF2" ] && echo 1 || echo 0)" "重建后原账户可登录"
 
-ROOMS2="$(curl -s -b "$JAR2" "$BASE/api/rooms")"
-N2="$(printf '%s' "$ROOMS2" | grep -o '"id":' | wc -l | tr -d ' ')"
-ck "$([ "$N2" = "2" ] && echo 1 || echo 0)" "重建后房间仍在 ($N2 个)"
-printf '%s' "$ROOMS2" | grep -q '验证服务器' && ck 1 "重建后房间与服务器关联仍在" || ck 0 "重建后房间与服务器关联仍在"
+MAPS2="$(curl -s -b "$JAR2" "$BASE/api/mappings")"
+N2="$(printf '%s' "$MAPS2" | grep -o '"id":' | wc -l | tr -d ' ')"
+ck "$([ "$N2" = "2" ] && echo 1 || echo 0)" "重建后映射仍在 ($N2 条)"
+printf '%s' "$MAPS2" | grep -q '"localPort":25000' && ck 1 "重建后本地端口保持原样" || ck 0 "重建后本地端口保持原样"
+printf '%s' "$MAPS2" | grep -q '"targetHost":"www.okuapi.xyz"' && ck 1 "重建后目标服务器地址仍在" || ck 0 "重建后目标服务器地址仍在"
+printf '%s' "$MAPS2" | grep -q '"targetPort":9901' && ck 1 "重建后目标端口保持原样" || ck 0 "重建后目标端口保持原样"
 EV="$(curl -s -b "$JAR2" "$BASE/api/events?limit=100")"
-printf '%s' "$EV" | grep -q 'room.start.refused' && ck 1 "重建后审计事件仍在" || ck 0 "重建后审计事件仍在"
+printf '%s' "$EV" | grep -q 'mapping.start.refused' && ck 1 "重建后审计事件仍在" || ck 0 "重建后审计事件仍在"
 
 say "前端"
 # The image must not ship an unparseable front end. A syntax error here is a blank

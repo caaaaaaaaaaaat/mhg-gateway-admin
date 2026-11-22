@@ -15,8 +15,8 @@ test('defaultConfig is valid and complete', () => {
     assert.equal(config.server.port, 8720);
     assert.equal(config.storage.driver, 'sqlite');
     assert.equal(config.auth.sessionTtlHours, 12);
-    assert.equal(config.gateways.citraPortRange[0], 25000);
-    assert.deepEqual(config.gateways.citraPortRange, [25000, 25999]);
+    assert.equal(config.gateways.localPortRange[0], 25000);
+    assert.deepEqual(config.gateways.localPortRange, [25000, 25999]);
     assert.equal(config.logging.level, 'info');
 });
 
@@ -88,8 +88,8 @@ test('validation rejects out-of-range and unknown values with dotted paths', () 
         [{ server: { port: 0 } }, 'server.port'],
         [{ server: { port: 70000 } }, 'server.port'],
         [{ storage: { driver: 'postgres' } }, 'storage.driver'],
-        [{ gateways: { citraPortRange: [26000, 25000] } }, 'gateways.citraPortRange'],
-        [{ gateways: { citraPortRange: [1] } }, 'gateways.citraPortRange'],
+        [{ gateways: { localPortRange: [26000, 25000] } }, 'gateways.localPortRange'],
+        [{ gateways: { localPortRange: [1] } }, 'gateways.localPortRange'],
         [{ logging: { level: 'verbose' } }, 'logging.level'],
         [{ auth: { secureCookies: 'sometimes' } }, 'auth.secureCookies'],
         [{ auth: { passwordMinLength: 4 } }, 'auth.passwordMinLength'],
